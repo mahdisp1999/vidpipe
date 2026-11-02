@@ -1,0 +1,1 @@
+# vidpipe.stages package (Step 2: stage interface + identity).

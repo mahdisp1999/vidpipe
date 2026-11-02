@@ -1,0 +1,21 @@
+# Step 1 fields: codec/crf/preset/queue_depth.
+codec: libx264
+crf: 18
+preset: medium
+queue_depth: 4
+
+# Step 2 fields: device/memory/stages.
+device: auto
+memory:
+  mode: auto
+  safety_margin_ram: 0.15
+  safety_margin_vram: 0.20
+  max_ram_gb: 0.0
+  max_vram_gb: 0.0
+  prefetch_depth: 2
+  prefetch_depth_max: 8
+  tile_size: 0
+  batch_size: 1
+  batch_size_max: 8
+stages:
+  - identity
