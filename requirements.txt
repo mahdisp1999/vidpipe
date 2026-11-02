@@ -1,3 +1,6 @@
 numpy
 pyyaml
 pytest
+spandrel
+# torch را جدا و با نسخهٔ CUDA مناسب GPU نصب کن (از pytorch.org)
+torch

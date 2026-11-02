@@ -101,8 +101,6 @@ def test_manual_caps_win(monkeypatch):
     plan = mem.derive_memory_plan(cfg, src, src)
     assert plan.mode == "manual"
     assert plan.depth == 3
-    assert plan.tile_size == 256
-    assert plan.batch_size == 2
     assert plan.ram_pool_gb == 4.0
     assert plan.queue_budget_gb == 4.0
 

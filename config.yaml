@@ -1,21 +1,37 @@
-# Step 1 fields: codec/crf/preset/queue_depth.
-codec: libx264
-crf: 18
-preset: medium
-queue_depth: 4
+# ---------- مرحلهٔ ۱: خروجی ویدیو ----------
+codec: libx264          # کدک ویدیوی خروجی
+crf: 18                 # کیفیت (عدد کمتر = کیفیت بیشتر)
+preset: fast          # سرعت انکود
+queue_depth: 4          # حداکثر تعداد فریم در هر صف
 
-# Step 2 fields: device/memory/stages.
-device: auto
+# ---------- مرحلهٔ ۲: دستگاه و حافظه ----------
+device: gpu            # auto | gpu | cpu
 memory:
-  mode: auto
+  mode: auto            # auto (خودکار) | manual (سقف‌های دستی)
   safety_margin_ram: 0.15
   safety_margin_vram: 0.20
-  max_ram_gb: 0.0
-  max_vram_gb: 0.0
+  max_ram_gb: 0.0       # فقط در حالت manual
+  max_vram_gb: 0.0      # فقط در حالت manual
   prefetch_depth: 2
   prefetch_depth_max: 8
   tile_size: 0
   batch_size: 1
   batch_size_max: 8
+
+# ---------- زنجیرهٔ مراحل (به ترتیب اجرا می‌شوند) ----------
 stages:
-  - identity
+  # - name: identity      # فقط عبور فریم (برای تست لوله)
+
+# نمونهٔ یک مرحلهٔ مدل (بعد از نصب مدل، خط identity را با این جایگزین کن):
+ - name: model
+   model: ./models/1xDeJPG_OmniSR.pth
+   tile_size: 192
+   tile_pad: 16
+#  - name: model
+  #  model: ./models/1x-Debandurh-FS-Ultra-lite.pth
+  #  tile_size: 192
+  #  tile_pad: 16
+#  - name: model
+  #  model: ./models/realesr-general-wdn-x4v3.pth
+  #  tile_size: 192
+  #  tile_pad: 16

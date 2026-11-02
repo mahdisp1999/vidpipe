@@ -1,10 +1,12 @@
-"""YAML config loader + validation (Step 1 fields + Step 2 device/memory/stages).
+"""بارگذار و اعتبارسنجی فایل پیکربندی YAML.
 
-# بارگذار و اعتبارسنجی پیکربندی YAML: فیلدهای مرحلهٔ ۱ + دستگاه/حافظه/مراحل مرحلهٔ ۲.
+کلیدهایی که در فایل نیستند مقدار پیش‌فرض می‌گیرند.
+هر خطای پیکربندی با ValueError و پیام واضح رد می‌شود.
 """
 
 from __future__ import annotations
 
+import copy
 import os
 from typing import Any, Dict
 
@@ -13,12 +15,11 @@ import yaml
 from .registry import resolve
 
 REQUIRED_FIELDS = ("codec", "crf", "preset", "queue_depth")
-VALID_CODECS = ("libx264", "libx265", "libsvtav1")  # not hard-coded usage; validated lightly
 VALID_DEVICES = ("auto", "gpu", "cpu")
 VALID_MEMORY_MODES = ("auto", "manual")
 
-# پیش‌فرض‌های حافظه وقتی فیلد در پیکربندی نباشد.
-_DEFAULTS = {
+# مقادیر پیش‌فرض وقتی کلیدی در فایل نباشد.
+_DEFAULTS: Dict[str, Any] = {
     "device": "auto",
     "memory": {
         "mode": "auto",
@@ -35,27 +36,28 @@ _DEFAULTS = {
 
 
 def _merge_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Fill missing keys with defaults (shallow for top-level, deep for memory).
+    """کلیدهای غایب را با پیش‌فرض پر می‌کند.
 
-    # کلیدهای غایب را با پیش‌فرض پر می‌کند (سطحی برای بالا، عمیق برای memory).
+    # deepcopy لازم است تا لیست و دیکشنری پیش‌فرض بین اجراهای مختلف مشترک نماند.
     """
-    out = dict(_DEFAULTS)
+    out = copy.deepcopy(_DEFAULTS)
     out.update(data)
-    mem = dict(_DEFAULTS["memory"])
-    mem.update(data.get("memory", {}))
-    out["memory"] = mem
+    # بخش memory جدا ادغام می‌شود تا کلیدهای غایبش هم پیش‌فرض بگیرند.
+    out["memory"] = {**_DEFAULTS["memory"], **data.get("memory", {})}
     return out
 
 
 def load_config(path: str) -> Dict[str, Any]:
+    """فایل YAML را می‌خواند، پیش‌فرض‌ها را پر می‌کند و اعتبارسنجی می‌کند."""
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):
         raise ValueError("config must be a mapping")
+
+    # فیلدهای اجباری مرحلهٔ ۱
     for field in REQUIRED_FIELDS:
         if field not in data:
             raise ValueError(f"missing config field: {field}")
-    # validate Step 1 fields
     if not isinstance(data["codec"], str):
         raise ValueError("codec must be string")
     if not isinstance(data["crf"], int):
@@ -67,11 +69,11 @@ def load_config(path: str) -> Dict[str, Any]:
 
     data = _merge_defaults(data)
 
-    # device
+    # دستگاه
     if data["device"] not in VALID_DEVICES:
         raise ValueError(f"device must be one of {VALID_DEVICES}")
 
-    # memory
+    # حافظه
     mem = data["memory"]
     if mem["mode"] not in VALID_MEMORY_MODES:
         raise ValueError(f"memory.mode must be one of {VALID_MEMORY_MODES}")
@@ -88,17 +90,18 @@ def load_config(path: str) -> Dict[str, Any]:
         if not isinstance(mem[key], (int, float)) or mem[key] < 0:
             raise ValueError(f"memory.{key} must be non-negative number")
 
-    # stages: فهرست نگاشت‌ها؛ هر کدام باید name معتبر داشته باشد و پارامترهای مدل درست باشند.
+    # مراحل: فهرستی از دیکشنری‌ها که هرکدام کلید name دارند.
     stages = data["stages"]
     if not isinstance(stages, list) or not stages:
         raise ValueError("stages must be a non-empty list")
     for entry in stages:
         if not isinstance(entry, dict):
-            raise ValueError("stages entries must be mappings (dicts)")
+            raise ValueError("stages entries must be mappings, e.g. '- name: identity'")
         name = entry.get("name")
         if not isinstance(name, str):
             raise ValueError("each stage must have a string 'name'")
-        resolve(name)  # نام ناشناس خطای واضح می‌دهد
+        resolve(name)  # نام ناشناس اینجا خطای واضح می‌دهد
+
         if name == "model":
             model_path = entry.get("model")
             if not isinstance(model_path, str) or not model_path:

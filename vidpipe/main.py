@@ -1,19 +1,22 @@
-"""CLI entry point: run the configured stage chain on one video.
+"""نقطهٔ ورود خط فرمان: اجرای زنجیرهٔ مراحل روی یک ویدیو.
 
-# نقطهٔ ورود خط فرمان: اجرای زنجیرهٔ مراحل پیکربندی‌شده روی یک ویدیو.
-# کنترل‌ها: p=مکث، r=ازسرگیری، s=توقف و ذخیره، Ctrl+C=توقف و ذخیره.
-# خروجی همیشه MKV است و حتی بعد از توقف قابل پخش است.
+کنترل‌ها (در همان ترمینال، بعد از زدن Enter):
+    p = مکث
+    r = ادامه
+    s = توقف و ذخیره
+Ctrl+C هم مثل s عمل می‌کند. خروجی همیشه MKV است و حتی بعد از توقف پخش می‌شود.
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import signal
 import sys
 import threading
 
 from .config import load_config
-from .controller import Controller, State
+from .controller import Controller, State, StateError
 from .memory import derive_memory_plan
 from .registry import resolve
 from .stages.base import FrameSpec
@@ -21,10 +24,7 @@ from .video_io import VideoReader, VideoWriter
 
 
 def _build_stages(cfg: dict, device: str):
-    """Instantiate and load each configured stage in order.
-
-    # هر مرحلهٔ پیکربندی‌شده را به‌ترتیب می‌سازد و بارگذاری می‌کند.
-    """
+    """هر مرحلهٔ پیکربندی‌شده را به ترتیب می‌سازد و لود می‌کند."""
     stages = []
     for entry in cfg["stages"]:
         cls = resolve(entry["name"])
@@ -35,10 +35,9 @@ def _build_stages(cfg: dict, device: str):
 
 
 def _final_spec(stages, src_spec: FrameSpec) -> FrameSpec:
-    """Chain plan() over stages to get the final output spec.
+    """مشخصات نهایی خروجی را با زنجیره‌کردن plan() روی مراحل به دست می‌آورد.
 
-    # با زنجیره‌کردن plan() روی مراحل، مشخصات نهایی خروجی به‌دست می‌آید.
-    # این اندازه برای ساخت VideoWriter لازم است تا output_scale درست کار کند.
+    # این اندازه برای ساخت VideoWriter لازم است.
     """
     spec = src_spec
     for st in stages:
@@ -46,12 +45,26 @@ def _final_spec(stages, src_spec: FrameSpec) -> FrameSpec:
     return spec
 
 
+def _try(action) -> None:
+    """یک دستور کنترلی را اجرا می‌کند.
+
+    # اگر حالت فعلی اجازهٔ آن دستور را ندهد (مثلاً مکث وقتی در حال توقف است)،
+    # خطا را بی‌صدا رد می‌کنیم تا برنامه کرش نکند.
+    """
+    try:
+        action()
+    except StateError:
+        pass
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="vidpipe local video enhancement pipeline")
-    parser.add_argument("input", help="input video path")
-    parser.add_argument("output", help="output video path (MKV recommended)")
-    parser.add_argument("--config", default="config.yaml", help="config file path")
+    parser.add_argument("input", help="مسیر ویدیوی ورودی")
+    parser.add_argument("output", help="مسیر ویدیوی خروجی (MKV پیشنهاد می‌شود)")
+    parser.add_argument("--config", default="config.yaml", help="مسیر فایل پیکربندی")
     args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
     cfg = load_config(args.config)
     reader = VideoReader(args.input)
@@ -60,70 +73,52 @@ def main(argv=None) -> int:
         fps=reader.fps, frame_size=reader.frame_size,
     )
 
-    # انتخاب دستگاه و برنامهٔ حافظه (فقط برای لاگ؛ مدل‌ها خودشان بارگذاری می‌شوند).
+    # انتخاب دستگاه و لاگ برنامهٔ حافظه (مدل‌ها خودشان لود می‌شوند).
     plan = derive_memory_plan(cfg, src_spec, src_spec)
-    device = plan.device
-
-    # ساخت و بارگذاری مراحل؛ اندازهٔ نهایی خروجی از آخرین مرحله می‌آید.
-    stages = _build_stages(cfg, device)
+    stages = _build_stages(cfg, plan.device)
     out_spec = _final_spec(stages, src_spec)
 
     writer = VideoWriter(
         args.output, out_spec.width, out_spec.height, out_spec.fps,
         cfg["codec"], cfg["crf"], cfg["preset"], args.input,
     )
-
     controller = Controller()
 
-    # Ctrl+C -> controller.stop() (توقف و ذخیره)، نه kill پردازش.
+    # Ctrl+C = توقف و ذخیره، نه kill پردازش.
     def on_sigint(_sig, _frame):
-        controller.stop()
+        _try(controller.stop)
 
     signal.signal(signal.SIGINT, on_sigint)
 
-    # چاپ تغییر حالت فقط یک بار (RUNNING/PAUSED/STOPPING/STOPPED/FINISHED).
-    last_state = None
+    def on_done(state: State) -> None:
+        print(f"[vidpipe] state: {state.name}")
 
-    def on_state_change(state: State) -> None:
-        nonlocal last_state
-        if state is not last_state:
-            print(f"[vidpipe] state: {state.name}")
-            last_state = state
+    controller.start(reader, writer, cfg["queue_depth"], stages=stages, on_done=on_done)
 
-    controller.start(reader, writer, cfg["queue_depth"], stages=stages,
-                     on_done=on_state_change)
-
-    # رشتهٔ پس‌زمینه برای خواندن دستورهای صفحه‌کلید از stdin.
-    # p=مکث، r=ازسرگیری، s=توقف و ذخیره (مثل Ctrl+C).
-    def _stdin_loop() -> None:
+    # رشتهٔ پس‌زمینه برای خواندن دستورها از ترمینال.
+    def stdin_loop() -> None:
         for line in sys.stdin:
             cmd = line.strip().lower()
             if cmd == "p":
-                try:
-                    controller.pause()
-                except Exception:  # noqa: BLE001 - اگر در حالت مجاز نباشد نادیده بگیر
-                    pass
+                _try(controller.pause)
             elif cmd == "r":
-                try:
-                    controller.resume()
-                except Exception:  # noqa: BLE001
-                    pass
+                _try(controller.resume)
             elif cmd == "s":
-                controller.stop()
+                _try(controller.stop)
                 break
+            else:
+                continue
+            print(f"[vidpipe] state: {controller.state.name}")
 
-    stdin_thread = threading.Thread(target=_stdin_loop, daemon=True, name="stdin-cmds")
-    stdin_thread.start()
+    threading.Thread(target=stdin_loop, daemon=True, name="stdin-cmds").start()
 
-    # منتظر رسیدن به حالت نهایی (FINISHED/STOPPED/FAILED) می‌مانیم.
+    # منتظر حالت نهایی (FINISHED / STOPPED / FAILED) می‌مانیم.
     controller.wait()
     reader.close()
     for st in stages:
         st.release()
 
-    if controller.state == State.FAILED:
-        return 1
-    return 0
+    return 1 if controller.state == State.FAILED else 0
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
-"""Generic model stage: runs one .pth model (restore or upscale) with tiling.
+"""مرحلهٔ مدل: یک فایل .pth را با spandrel لود و روی هر فریم اجرا می‌کند.
 
-# مرحلهٔ مدل: یک فایل .pth را با spandrel بارگذاری و با تایلینگ اجرا می‌کند.
-# هم برای restore (1x) و هم برای upscale (Nx) استفاده می‌شود؛ تنها جایی که مدل اجرا می‌شود.
+تایلینگ: تصویر را تکه‌تکه (کاشی) به مدل می‌دهیم تا حافظه کم مصرف شود.
+برای این‌که مرز کاشی‌ها درز نداشته باشد، کل تصویر یک‌بار با حاشیه (padding)
+بزرگ می‌شود. هر کاشی همراه پیکسل‌های همسایه‌اش به مدل داده می‌شود و بعد
+از اجرا، حاشیهٔ اضافه بریده می‌شود.
 """
 
 from __future__ import annotations
@@ -15,26 +17,25 @@ from .base import Frame, FrameSpec, Stage
 
 log = logging.getLogger(__name__)
 
-# torch اختیاری است؛ اگر نصب نباشد، مدل قابل اجرا نیست.
+# torch و spandrel اختیاری‌اند؛ بدونشان فقط این مرحله قابل استفاده نیست.
 try:
-    import torch  # type: ignore
-    from spandrel import ImageModelDescriptor, ModelLoader  # type: ignore
+    import torch
+    import torch.nn.functional as F
+    from spandrel import ImageModelDescriptor, ModelLoader
     _HAS_TORCH = True
-except ImportError:  # pragma: no cover - torch یا spandrel نصب نیست
+except ImportError:  # pragma: no cover
     torch = None  # type: ignore
+    F = None  # type: ignore
     ImageModelDescriptor = None  # type: ignore
     ModelLoader = None  # type: ignore
     _HAS_TORCH = False
 
 
 class ModelStage(Stage):
-    """Runs one model on each frame, tiled, with optional output resize.
-
-    # یک مدل را روی هر فریم با تایلینگ اجرا می‌کند؛ resize خروجی اختیاری است.
-    """
+    """یک مدل را روی هر فریم با تایلینگ اجرا می‌کند؛ resize خروجی اختیاری است."""
 
     def __init__(self) -> None:
-        self.model: Optional[ImageModelDescriptor] = None
+        self.model: Optional[Any] = None
         self.device = "cpu"
         self.scale = 1
         self.tile_size = 512
@@ -43,7 +44,7 @@ class ModelStage(Stage):
         self.half = False
 
     def load(self, device: str, params: Any) -> None:
-        # بارگذاری مدل با spandrel؛ یک بار در هر اجرا.
+        """مدل را یک‌بار بارگذاری می‌کند و روی دستگاه می‌برد."""
         if not _HAS_TORCH:
             raise RuntimeError("torch and spandrel are required to run model stages")
         self.device = device
@@ -51,26 +52,23 @@ class ModelStage(Stage):
         self.tile_pad = int(params.get("tile_pad", 16))
         self.output_scale = params.get("output_scale")
         self.half = bool(params.get("half", False))
+
         model_path = params["model"]
-        # spandrel معماری را از وزن‌ها تشخیص می‌دهد.
+        # spandrel معماری مدل را از روی وزن‌ها تشخیص می‌دهد.
         desc = ModelLoader().load_from_file(model_path)
         if not isinstance(desc, ImageModelDescriptor):
             raise RuntimeError(f"model {model_path!r} is not an image model")
-        self.model = desc
         self.scale = int(desc.scale)
-        # انتقال به دستگاه و حالت inference.
-        self.model.to(device).eval()
-        # fp16 فقط روی CUDA و اگر مدل پشتیبانی کند.
+        desc.to(device).eval()
+        # fp16 فقط روی CUDA و فقط اگر مدل پشتیبانی کند.
         if self.half and device == "cuda" and desc.supports_half:
-            self.model.half()
-        log.info(
-            "model=%s arch=%s scale=%d device=%s loaded once",
-            model_path, desc.architecture, self.scale, device,
-        )
+            desc.half()
+        self.model = desc
+        log.info("model=%s arch=%s scale=%d device=%s loaded once",
+                 model_path, desc.architecture, self.scale, device)
 
     def plan(self, src_spec: FrameSpec) -> FrameSpec:
-        # اندازهٔ خروجی = ورودی × scale مدل، سپس × output_scale اگر داده شده باشد.
-        # اگر output_scale داده شود، اندازهٔ نهایی = ورودی × output_scale.
+        """اندازهٔ خروجی: ورودی × scale مدل، و اگر output_scale بود، ورودی × output_scale."""
         if self.output_scale is not None:
             w = int(round(src_spec.width * self.output_scale))
             h = int(round(src_spec.height * self.output_scale))
@@ -80,69 +78,69 @@ class ModelStage(Stage):
         return FrameSpec(width=w, height=h, fps=src_spec.fps, frame_size=w * h * 3)
 
     def push(self, frame: Frame) -> List[Frame]:
-        # uint8 HWC RGB -> float NCHW در 0..1 روی دستگاه؛ اجرای مدل با تایلینگ؛
-        # تبدیل به uint8 HWC؛ و در صورت output_scale، resize به اندازهٔ برنامه‌ریزی‌شده.
+        """یک فریم rgb24 می‌گیرد و فریم پردازش‌شده برمی‌گرداند."""
         if self.model is None:
             raise RuntimeError("model not loaded")
-        img = np.frombuffer(frame.data, dtype=np.uint8).reshape(
-            frame.spec.height, frame.spec.width, 3)
-        # HWC uint8 -> NCHW float در 0..1 روی دستگاه.
-        t = torch.from_numpy(img).permute(2, 0, 1).float().div_(255.0)
-        t = t.unsqueeze(0).to(self.device)
+        h, w = frame.spec.height, frame.spec.width
+
+        # بایت‌های خام -> تنسور float در بازهٔ 0..1 با شکل (1, 3, H, W)
+        img = np.frombuffer(frame.data, dtype=np.uint8).reshape(h, w, 3).copy()
+        x = torch.from_numpy(img).permute(2, 0, 1).float().div(255.0).unsqueeze(0)
+        x = x.to(self.device)
         if self.half and self.device == "cuda":
-            t = t.half()
-        out = self._run_tiled(t)
-        # resize خروجی به اندازهٔ برنامه‌ریزی‌شده (bicubic روی دستگاه، بدون وابستگی جدید).
-        if self.output_scale is not None:
-            out = torch.nn.functional.interpolate(
-                out, size=(frame.spec.height * self.scale, frame.spec.width * self.scale),
-                mode="bicubic", align_corners=False)
-        # NCHW float -> HWC uint8.
-        out = out.squeeze(0).clamp_(0.0, 1.0).mul_(255.0).byte()
-        out = out.permute(1, 2, 0).cpu().numpy()
+            x = x.half()
+
+        with torch.no_grad():
+            out = self._run_tiled(x)
+
+        # اگر output_scale داده شده، خروجی به اندازهٔ برنامه‌ریزی‌شده می‌رود.
         spec = self.plan(frame.spec)
-        return [Frame(data=out.tobytes(), spec=spec)]
+        if self.output_scale is not None:
+            out = F.interpolate(out, size=(spec.height, spec.width),
+                                mode="bicubic", align_corners=False)
 
-    def _run_tiled(self, t: "torch.Tensor") -> "torch.Tensor":
-        """Run the model on tiles with reflect padding; seams line up exactly.
+        # float -> uint8 با گرد کردن (نه قطع کردن) تا رنگ‌ها تیره‌تر نشوند.
+        out = out.float().squeeze(0).clamp(0.0, 1.0).mul(255.0).round().byte()
+        data = out.permute(1, 2, 0).contiguous().cpu().numpy().tobytes()
+        return [Frame(data=data, spec=spec)]
 
-        # اجرای مدل روی تایل‌ها با padding بازتابی؛ درزها دقیقاً هم‌راستا می‌شوند.
-        # چرا padding: مدل‌های SR به پیکسل‌های اطراف نیاز دارند؛ بدون padding لبهٔ هر
-        # تایل مصنوعی می‌شود. چرا برش: خروجی مدل به اندازهٔ padding × scale بزرگ‌تر است؛
-        # این حاشیهٔ اضافه را برمی‌داریم تا تایل‌ها دقیقاً کنار هم بنشینند.
+    def _run_tiled(self, x: "torch.Tensor") -> "torch.Tensor":
+        """مدل را روی کاشی‌ها اجرا می‌کند و خروجی کامل را می‌سازد.
+
+        # چرا کل تصویر را یک‌بار pad می‌کنیم؟
+        # اگر هر کاشی جدا pad شود، لبهٔ کاشی‌ها بازتاب خودِ کاشی می‌شود و
+        # روی مرز درز دیده می‌شود. با pad کردن کل تصویر، هر کاشی پیکسل‌های
+        # واقعی همسایه را می‌بیند.
         """
-        _, _, h, w = t.shape
-        scale = self.scale
+        _, c, h, w = x.shape
+        s = self.scale
         pad = self.tile_pad
         tile = self.tile_size
-        out = torch.zeros(
-            (1, t.shape[1], h * scale, w * scale),
-            dtype=t.dtype, device=t.device,
-        )
-        # گام تایل‌ها؛ آخرین تایل به لبهٔ تصویر می‌چسبد.
+
+        # reflect فقط وقتی کار می‌کند که حاشیه از اندازهٔ تصویر کوچک‌تر باشد.
+        mode = "reflect" if pad < min(h, w) else "replicate"
+        x_pad = F.pad(x, (pad, pad, pad, pad), mode=mode)
+
+        out = torch.zeros((1, c, h * s, w * s), dtype=x.dtype, device=x.device)
         for y in range(0, h, tile):
             y_end = min(y + tile, h)
-            for x in range(0, w, tile):
-                x_end = min(x + tile, w)
-                # برش تایل واقعی از تصویر (نه صفر) و padding بازتابی.
-                crop = t[:, :, y:y_end, x:x_end]
-                padded = torch.nn.functional.pad(
-                    crop, (pad, pad, pad, pad), mode="reflect")
-                with torch.no_grad():
-                    res = self.model(padded)
-                # برش حاشیهٔ padding از خروجی (pad × scale پیکسل از هر طرف).
-                p = pad * scale
-                res = res[:, :, p:p + (y_end - y) * scale, p:p + (x_end - x) * scale]
-                out[:, :, y * scale:y_end * scale, x * scale:x_end * scale] = res
+            for x0 in range(0, w, tile):
+                x_end = min(x0 + tile, w)
+                # کاشی + حاشیهٔ همسایه از تصویر pad‌شده
+                crop = x_pad[:, :, y:y_end + 2 * pad, x0:x_end + 2 * pad]
+                res = self.model(crop)
+                # فقط بخش اصلی کاشی (بدون حاشیه) را برمی‌داریم
+                core = res[:, :, pad * s:pad * s + (y_end - y) * s,
+                           pad * s:pad * s + (x_end - x0) * s]
+                out[:, :, y * s:y_end * s, x0 * s:x_end * s] = core
         return out
 
     def flush(self) -> List[Frame]:
-        # هیچ فریم بافری وجود ندارد.
+        """این مرحله بافر ندارد."""
         return []
 
     def release(self) -> None:
-        # آزادسازی مدل و پاک‌سازی حافظهٔ CUDA.
-        if self.model is not None:
-            self.model = None
-        if _HAS_TORCH and torch is not None and torch.cuda.is_available():
+        """مدل را آزاد و حافظهٔ CUDA را خالی می‌کند."""
+        self.model = None
+        if _HAS_TORCH and torch.cuda.is_available():
             torch.cuda.empty_cache()

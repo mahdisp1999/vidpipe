@@ -13,17 +13,18 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # داخل یک مرحله فقط مدل‌های هم‌معماری و هم‌scale را می‌توان با وزن ترکیب کرد.
 STAGES = [
     # مرحله ۱: رفع blocking (1x، کیفیت را بالا می‌برد بدون بزرگ‌نمایی)
-    [("./models/1xDeJPG_OmniSR.pth", 2.0)],
-
+    [("./models/1xDeJPG_OmniSR.pth", 1.0)],
+    # [("./models/1x-Debandurh-FS-Ultra-lite.pth", 1.0)],
+    # [("./models/1x-Debandurh-FS-Ultra-lite.pth", 1.0)],
     # مرحله ۲: بزرگ‌نمایی ۴x (دو مدل هم‌معماری، ترکیب وزنی)
     [
-        ("./models/realesr-general-x4v3.pth", 0.8),
-        ("./models/realesr-general-wdn-x4v3.pth", 0.2),
+        ("./models/realesr-general-x4v3.pth", 0.7),
+        ("./models/realesr-general-wdn-x4v3.pth", 0.3),
     ],
     # [("./models/4xFaceUpSharpDAT.pth", 1.0)],
 ]
 
-INPUT_PATH = "./Input/Image_profile_telegram_instagram_portrait8.webp"
+INPUT_PATH = "./Input/file"
 OUTPUT_DIR = "./output"
 TILE = 192
 OVERLAP = 16
@@ -186,10 +187,10 @@ def main():
     y = run_chain(x, STAGES)
     y = y.squeeze(0).clamp(0, 1).permute(1, 2, 0).cpu().numpy()
 
-    output_path = make_unique_output_path(INPUT_PATH, OUTPUT_DIR, STAGES, ext=".png")
+    output_path = make_unique_output_path(INPUT_PATH, OUTPUT_DIR, STAGES, ext=".jpg")
     # Image.fromarray((y * 255).round().astype(np.uint8)).save(output_path, optimize=True, quality=95)
-    # Image.fromarray((y * 255).round().astype(np.uint8)).save(output_path, format="JPEG", quality=93, subsampling=0)
-    Image.fromarray((y * 255).round().astype(np.uint8)).save(output_path, format="WEBP", quality=92, method=5)
+    Image.fromarray((y * 255).round().astype(np.uint8)).save(output_path, format="JPEG", quality=93, subsampling=0)
+    # Image.fromarray((y * 255).round().astype(np.uint8)).save(output_path, format="WEBP", quality=92, method=5)
     print(f"ذخیره شد: {output_path}")
 
 
