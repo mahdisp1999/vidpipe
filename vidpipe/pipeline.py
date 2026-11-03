@@ -1,24 +1,17 @@
-"""لوله‌ی پردازش: سه رشته که با دو صف کران‌دار به هم وصل‌اند.
-
-    reader (خواندن فریم) --q_rp--> pipeline (اجرای مراحل) --q_pw--> writer (نوشتن)
-
-صف‌ها کران‌دار هستند، پس مصرف حافظه به طول ویدیو وابسته نیست.
-
-قاعدهٔ مهم: هیچ انتظار بی‌پایانی وجود ندارد. هر put و get با timeout انجام
-می‌شود و هر بار وضعیت توقف یا خطا بررسی می‌شود.
-"""
+"""Three-thread video pipeline with bounded queues and per-stage timing."""
 
 from __future__ import annotations
 
 import queue
 import threading
-from typing import Callable, List, Optional
+import time
+from typing import Callable, Optional
 
 from .stages.base import Frame, FrameSpec, Stage
 from .video_io import VideoReader, VideoWriter
 
-_SENTINEL = None  # نشانهٔ پایان جریان داخل صف‌ها
-_TICK = 0.1       # هر چند ثانیه وضعیت توقف بررسی شود
+_SENTINEL = None
+_TICK = 0.1
 
 
 class Pipeline:
@@ -29,44 +22,47 @@ class Pipeline:
         queue_depth: int,
         pause_event: threading.Event,
         stop_event: threading.Event,
-        stages: Optional[List[Stage]] = None,
+        stages: Optional[list[Stage]] = None,
     ) -> None:
         self.reader = reader
         self.writer = writer
-        self.q_rp: queue.Queue = queue.Queue(maxsize=queue_depth)  # reader -> pipeline
-        self.q_pw: queue.Queue = queue.Queue(maxsize=queue_depth)  # pipeline -> writer
+        self.q_rp: queue.Queue = queue.Queue(maxsize=queue_depth)
+        self.q_pw: queue.Queue = queue.Queue(maxsize=queue_depth)
         self.pause_event = pause_event
-        self.stop_event = stop_event          # توقف درخواستی کاربر (s یا Ctrl+C)
-        self.stages: List[Stage] = stages or []
-        self.processed = 0                    # تعداد فریم‌های نوشته‌شده
+        self.stop_event = stop_event
+        self.stages = stages or []
 
+        self.processed = 0
+        self.frames_read = 0
+        self.read_seconds = 0.0
+        self.stage_seconds = 0.0
+        self.write_seconds = 0.0
+        self.stage_timings: dict[str, float] = {}
+        self._stats_lock = threading.Lock()
         self._error: Optional[BaseException] = None
-        # abort: اگر هر رشته‌ای خطا بدهد، بقیه باید بی‌درنگ کنار بیایند.
+        self._error_lock = threading.Lock()
         self._abort = threading.Event()
-        # writer_failed: نویسنده مرده؛ دیگر کسی صف را خالی نمی‌کند.
         self._writer_failed = threading.Event()
-
-        self._src_spec = FrameSpec(
-            width=reader.width, height=reader.height,
-            fps=reader.fps, frame_size=reader.frame_size,
+        self._threads: list[threading.Thread] = []
+        self._source_spec = FrameSpec(
+            width=reader.width,
+            height=reader.height,
+            fps=reader.fps,
+            frame_size=reader.frame_size,
         )
-        self._threads: List[threading.Thread] = []
 
-    # ------------------------------------------------------------ کنترل کلی
     def start(self) -> None:
-        """سه رشته را راه می‌اندازد."""
         self._threads = [
-            threading.Thread(target=self._reader, daemon=True, name="reader"),
-            threading.Thread(target=self._pipeline, daemon=True, name="pipeline"),
-            threading.Thread(target=self._writer, daemon=True, name="writer"),
+            threading.Thread(target=self._reader_loop, daemon=True, name="vidpipe-reader"),
+            threading.Thread(target=self._pipeline_loop, daemon=True, name="vidpipe-pipeline"),
+            threading.Thread(target=self._writer_loop, daemon=True, name="vidpipe-writer"),
         ]
-        for t in self._threads:
-            t.start()
+        for thread in self._threads:
+            thread.start()
 
     def join(self) -> None:
-        """منتظر پایان هر سه رشته می‌ماند و اولین خطا را دوباره بالا می‌آورد."""
-        for t in self._threads:
-            t.join()
+        for thread in self._threads:
+            thread.join()
         if self._error is not None:
             raise self._error
 
@@ -74,22 +70,49 @@ class Pipeline:
     def error(self) -> Optional[BaseException]:
         return self._error
 
-    def _fail(self, e: BaseException) -> None:
-        """اولین خطا را ثبت و به بقیهٔ رشته‌ها اعلام توقف می‌کند."""
-        if self._error is None:
-            self._error = e
+    def status_snapshot(self) -> dict:
+        """Return a small, thread-safe snapshot for the live CLI reporter."""
+        with self._stats_lock:
+            values = {
+                "frames_read": self.frames_read,
+                "processed": self.processed,
+                "read_seconds": self.read_seconds,
+                "stage_seconds": self.stage_seconds,
+                "write_seconds": self.write_seconds,
+                "stage_timings": dict(self.stage_timings),
+            }
+        values.update({
+            "total_frames": self.reader.total_frames,
+            "exact_frame_count": self.reader.exact_frame_count,
+            "input_queue": self.q_rp.qsize(),
+            "output_queue": self.q_pw.qsize(),
+            "queue_depth": self.q_rp.maxsize,
+        })
+
+        tile_stage = next(
+            (stage for stage in self.stages if getattr(stage, "is_processing", False)), None
+        )
+        if tile_stage is None:
+            tile_stage = next((stage for stage in self.stages if hasattr(stage, "tiles_total")), None)
+        if tile_stage is not None:
+            values["tiles_completed"] = tile_stage.tiles_completed
+            values["tiles_total"] = tile_stage.tiles_total
+            values["tile_size"] = tile_stage.tile_size
+            values["tile_batch_size"] = tile_stage.last_batch_size
+            values["oom_retries"] = tile_stage.oom_retries
+            values["model_name"] = tile_stage.model_name
+        return values
+
+    def _fail(self, error: BaseException) -> None:
+        with self._error_lock:
+            if self._error is None:
+                self._error = error
         self._abort.set()
 
-    # ------------------------------------------------------------ ابزار صف
-    def _put(self, q: queue.Queue, item, should_halt: Callable[[], bool]) -> bool:
-        """آیتم را در صف می‌گذارد.
-
-        # اگر صف پر باشد، هر چند وقت یک‌بار should_halt را بررسی می‌کنیم.
-        # اگر توقف لازم شد، False برمی‌گردانیم تا رشته گیر نکند.
-        """
+    def _put(self, target: queue.Queue, item, should_halt: Callable[[], bool]) -> bool:
         while not should_halt():
             try:
-                q.put(item, timeout=_TICK)
+                target.put(item, timeout=_TICK)
                 return True
             except queue.Full:
                 continue
@@ -98,31 +121,36 @@ class Pipeline:
     def _reader_should_halt(self) -> bool:
         return self.stop_event.is_set() or self._abort.is_set()
 
-    # ------------------------------------------------------------ رشتهٔ reader
-    def _reader(self) -> None:
-        """فریم خام را از ffmpeg می‌خواند و در صف می‌گذارد."""
+    def _reader_loop(self) -> None:
         try:
             while not self._reader_should_halt():
                 if not self.pause_event.is_set():
-                    # مکث: فریمی نمی‌خوانیم، پس حافظه ثابت می‌ماند.
                     self.pause_event.wait(timeout=_TICK)
                     continue
+
+                started = time.perf_counter()
                 data = self.reader.read_frame()
-                if data is None:  # به انتهای ویدیو رسیدیم
+                elapsed = time.perf_counter() - started
+                with self._stats_lock:
+                    self.read_seconds += elapsed
+                if data is None:
                     break
+
+                with self._stats_lock:
+                    self.frames_read += 1
                 if not self._put(self.q_rp, data, self._reader_should_halt):
                     break
-        except BaseException as e:  # noqa: BLE001
-            self._fail(e)
+        except BaseException as error:  # Keep errors from worker threads visible to the main thread.
+            self._fail(error)
         finally:
-            # علامت پایان ورودی. اگر توقف باشد، pipeline دیگر منتظر نیست.
             self._put(self.q_rp, _SENTINEL, self._reader_should_halt)
 
-    # ------------------------------------------------------------ رشتهٔ pipeline
-    def _pipeline(self) -> None:
-        """هر فریم را از همهٔ مراحل پشت‌سرهم عبور می‌دهد."""
+    def _pipeline_loop(self) -> None:
         try:
             while not self._reader_should_halt():
+                if not self.pause_event.is_set():
+                    self.pause_event.wait(timeout=_TICK)
+                    continue
                 try:
                     data = self.q_rp.get(timeout=_TICK)
                 except queue.Empty:
@@ -131,59 +159,65 @@ class Pipeline:
                     break
                 if not self._emit(self._run_stages(data)):
                     return
-            # پایان ویدیو یا توقف: آنچه در بافر مراحل مانده را بیرون بده.
+
             self._emit(self._flush_stages())
-        except BaseException as e:  # noqa: BLE001
-            self._fail(e)
+        except BaseException as error:
+            self._fail(error)
         finally:
-            # علامت پایان به نویسنده. اگر نویسنده مرده باشد، رد می‌شود.
             self._put(self.q_pw, _SENTINEL, self._writer_failed.is_set)
 
-    def _run_stages(self, data: bytes) -> List[Frame]:
-        """یک فریم خام را از همهٔ مراحل عبور می‌دهد."""
-        frames = [Frame(data=data, spec=self._src_spec)]
-        for st in self.stages:
-            nxt: List[Frame] = []
-            for f in frames:
-                nxt.extend(st.push(f))
-            frames = nxt
+    def _run_stages(self, data: bytes) -> list[Frame]:
+        frames = [Frame(data=data, spec=self._source_spec)]
+        for stage_index, stage in enumerate(self.stages, start=1):
+            next_frames: list[Frame] = []
+            for frame in frames:
+                started = time.perf_counter()
+                try:
+                    next_frames.extend(stage.push(frame))
+                finally:
+                    elapsed = time.perf_counter() - started
+                    label = getattr(stage, "output_label", stage.__class__.__name__)
+                    name = f"{stage_index}:{label}"
+                    with self._stats_lock:
+                        self.stage_seconds += elapsed
+                        self.stage_timings[name] = self.stage_timings.get(name, 0.0) + elapsed
+            frames = next_frames
         return frames
 
-    def _flush_stages(self) -> List[Frame]:
-        """بافر مراحل را خالی می‌کند.
-
-        # خروجی flush هر مرحله باید از مراحل بعدی هم رد شود، برای همین
-        # ترتیب مراحل را نگه می‌داریم.
-        """
-        frames: List[Frame] = []
-        for st in self.stages:
-            nxt: List[Frame] = []
-            for f in frames:
-                nxt.extend(st.push(f))
-            nxt.extend(st.flush())
-            frames = nxt
+    def _flush_stages(self) -> list[Frame]:
+        frames: list[Frame] = []
+        for stage_index, stage in enumerate(self.stages, start=1):
+            next_frames: list[Frame] = []
+            for frame in frames:
+                next_frames.extend(stage.push(frame))
+            next_frames.extend(stage.flush())
+            frames = next_frames
         return frames
 
-    def _emit(self, frames: List[Frame]) -> bool:
-        """فریم‌های خروجی را به صف نویسنده می‌فرستد."""
-        for f in frames:
-            if not self._put(self.q_pw, f.data, self._abort.is_set):
+    def _emit(self, frames: list[Frame]) -> bool:
+        for frame in frames:
+            if not self._put(self.q_pw, frame.data, self._abort.is_set):
                 return False
         return True
 
-    # ------------------------------------------------------------ رشتهٔ writer
-    def _writer(self) -> None:
-        """فریم‌ها را به encoder می‌نویسد و در پایان stdin را می‌بندد."""
+    def _writer_loop(self) -> None:
         try:
             while True:
                 data = self.q_pw.get()
                 if data is _SENTINEL:
                     break
+                started = time.perf_counter()
                 self.writer.write_frame(data)
-                self.processed += 1
-        except BaseException as e:  # noqa: BLE001
+                elapsed = time.perf_counter() - started
+                with self._stats_lock:
+                    self.write_seconds += elapsed
+                    self.processed += 1
+        except BaseException as error:
             self._writer_failed.set()
-            self._fail(e)
+            self._fail(error)
         finally:
-            # بستن امن encoder: ffmpeg تمام می‌شود و MKV معتبر می‌ماند.
-            self.writer.close()
+            try:
+                self.writer.close()
+            except BaseException as error:
+                self._writer_failed.set()
+                self._fail(error)

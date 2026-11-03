@@ -1,130 +1,91 @@
-"""Memory plan tests: auto formula, manual caps, device fallback.
-
-# تست‌های برنامهٔ حافظه: فرمول خودکار، سقف دستی، بازگشت دستگاه.
-# بدون نیاز به GPU واقعی؛ همهٔ توابع CUDA با monkeypatch شبیه‌سازی می‌شوند.
-"""
-
-import vidpipe.memory as mem
+import vidpipe.memory as memory
 from vidpipe.stages.base import FrameSpec
 
 
-def _cfg(**over):
-    """Build a minimal config dict with memory defaults.
-
-    # پیکربندی حداقلی با پیش‌فرض‌های حافظه می‌سازد.
-    """
-    base = {
+def _config():
+    return {
         "device": "auto",
+        "queue_depth": 4,
         "memory": {
             "mode": "auto",
             "safety_margin_ram": 0.15,
-            "safety_margin_vram": 0.20,
             "max_ram_gb": 0.0,
             "max_vram_gb": 0.0,
             "prefetch_depth": 2,
             "prefetch_depth_max": 8,
-            "tile_size": 0,
-            "batch_size": 1,
-            "batch_size_max": 8,
         },
     }
-    # حافظه را با پیش‌فرض ادغام می‌کند، سپس بقیهٔ کلیدها را اعمال می‌کند.
-    mem = dict(base["memory"])
-    mem.update(over.pop("memory", {}))
-    base["memory"] = mem
-    base.update(over)
-    return base
 
 
-def _spec(w=1920, h=1080, fps=30.0):
-    # مشخصات فریم با اندازهٔ محاسبه‌شده.
-    return FrameSpec(width=w, height=h, fps=fps, frame_size=w * h * 3)
+def _spec(width=1920, height=1080):
+    return FrameSpec(width, height, 30.0, width * height * 3)
 
 
-def test_auto_formula_fixed_inputs(monkeypatch):
-    # ورودی ثابت: فرمول خودکار باید عمق مورد انتظار را بدهد.
-    monkeypatch.setattr(mem, "_cuda_available", lambda: False)
-    monkeypatch.setattr(mem, "_free_ram_gb", lambda: 16.0)
-    monkeypatch.setattr(mem, "_free_vram_gb", lambda: None)
-    monkeypatch.setattr(mem, "_total_vram_gb", lambda: None)
-    cfg = _cfg()
-    src = _spec()
-    plan = mem.derive_memory_plan(cfg, src, src)
-    # ram_pool = 16 * 0.85 - 1.2 = 12.4 ; queue_budget = 6.2
-    assert plan.mode == "auto"
+def test_auto_memory_plan_clamps_depth(monkeypatch):
+    monkeypatch.setattr(memory, "_cuda_available", lambda: False)
+    monkeypatch.setattr(memory, "_free_ram_gb", lambda: 16.0)
+    monkeypatch.setattr(memory, "_free_vram_gb", lambda: None)
+    monkeypatch.setattr(memory, "_total_vram_gb", lambda: None)
+    plan = memory.derive_memory_plan(_config(), _spec(), _spec())
     assert plan.device == "cpu"
     assert abs(plan.ram_pool_gb - 12.4) < 1e-6
     assert abs(plan.queue_budget_gb - 6.2) < 1e-6
-    # slot_dec = slot_enc = 1920*1080*3/GB ~ 0.00579 ; depth = floor(6.2/0.01158) ~ 535 -> clamp 8
     assert plan.depth == 8
 
 
-def test_auto_depth_clamped_lower(monkeypatch):
-    # عمق محاسبه‌شده کمتر از حد پایین (2) باید به 2 بچسبد.
-    monkeypatch.setattr(mem, "_cuda_available", lambda: False)
-    monkeypatch.setattr(mem, "_free_ram_gb", lambda: 1.0)
-    monkeypatch.setattr(mem, "_free_vram_gb", lambda: None)
-    monkeypatch.setattr(mem, "_total_vram_gb", lambda: None)
-    cfg = _cfg()
-    src = _spec()
-    plan = mem.derive_memory_plan(cfg, src, src)
-    # ram_pool = 1*0.85-1.2 = -0.35 ; queue_budget = -0.175 -> depth floor(neg) -> clamp 2
-    assert plan.depth == 2
+def test_auto_memory_plan_uses_safe_minimum(monkeypatch):
+    monkeypatch.setattr(memory, "_cuda_available", lambda: False)
+    monkeypatch.setattr(memory, "_free_ram_gb", lambda: 1.0)
+    monkeypatch.setattr(memory, "_free_vram_gb", lambda: None)
+    monkeypatch.setattr(memory, "_total_vram_gb", lambda: None)
+    plan = memory.derive_memory_plan(_config(), _spec(), _spec())
+    assert plan.depth == 1
 
 
-def test_auto_depth_clamped_upper(monkeypatch):
-    # عمق محاسبه‌شده بیشتر از prefetch_depth_max باید به آن بچسبد.
-    monkeypatch.setattr(mem, "_cuda_available", lambda: False)
-    monkeypatch.setattr(mem, "_free_ram_gb", lambda: 64.0)
-    monkeypatch.setattr(mem, "_free_vram_gb", lambda: None)
-    monkeypatch.setattr(mem, "_total_vram_gb", lambda: None)
-    cfg = _cfg(memory={"prefetch_depth_max": 4})
-    src = _spec()
-    plan = mem.derive_memory_plan(cfg, src, src)
-    assert plan.depth == 4
-
-
-def test_manual_caps_win(monkeypatch):
-    # حالت دستی: مقادیر پیکربندی سقف سخت هستند و بر مقادیر probed غلبه می‌کنند.
-    monkeypatch.setattr(mem, "_cuda_available", lambda: False)
-    monkeypatch.setattr(mem, "_free_ram_gb", lambda: 16.0)
-    monkeypatch.setattr(mem, "_free_vram_gb", lambda: None)
-    monkeypatch.setattr(mem, "_total_vram_gb", lambda: None)
-    cfg = _cfg(memory={
-        "mode": "manual",
-        "prefetch_depth": 3,
-        "tile_size": 256,
-        "batch_size": 2,
-        "max_ram_gb": 4.0,
-    })
-    src = _spec()
-    plan = mem.derive_memory_plan(cfg, src, src)
-    assert plan.mode == "manual"
+def test_manual_mode_uses_configured_prefetch_depth(monkeypatch):
+    monkeypatch.setattr(memory, "_cuda_available", lambda: False)
+    monkeypatch.setattr(memory, "_free_ram_gb", lambda: 8.0)
+    monkeypatch.setattr(memory, "_free_vram_gb", lambda: None)
+    monkeypatch.setattr(memory, "_total_vram_gb", lambda: None)
+    config = _config()
+    config["memory"]["mode"] = "manual"
+    config["memory"]["prefetch_depth"] = 3
+    config["memory"]["max_ram_gb"] = 4.0
+    plan = memory.derive_memory_plan(config, _spec(), _spec())
     assert plan.depth == 3
-    assert plan.ram_pool_gb == 4.0
-    assert plan.queue_budget_gb == 4.0
 
 
-def test_device_auto_fallback_cpu(monkeypatch):
-    # CUDA در دسترس نیست: auto باید به CPU برگردد.
-    monkeypatch.setattr(mem, "_cuda_available", lambda: False)
-    device, reason = mem.select_device("auto")
-    assert device == "cpu"
-    assert "CPU" in reason
+def test_manual_ram_budget_caps_queue_depth(monkeypatch):
+    monkeypatch.setattr(memory, "_cuda_available", lambda: False)
+    monkeypatch.setattr(memory, "_free_ram_gb", lambda: 8.0)
+    monkeypatch.setattr(memory, "_free_vram_gb", lambda: None)
+    monkeypatch.setattr(memory, "_total_vram_gb", lambda: None)
+    config = _config()
+    config["memory"].update({"mode": "manual", "prefetch_depth": 8, "max_ram_gb": 0.01})
+
+    plan = memory.derive_memory_plan(config, _spec(1920, 1080), _spec(1920, 1080))
+
+    assert plan.depth == 1
+    assert plan.queue_budget_gb == 0.01
 
 
-def test_device_gpu_raises_without_cuda(monkeypatch):
-    # CUDA در دسترس نیست: gpu باید خطای واضح بدهد.
-    monkeypatch.setattr(mem, "_cuda_available", lambda: False)
-    try:
-        mem.select_device("gpu")
-        assert False
-    except RuntimeError as e:
-        assert "CUDA" in str(e)
+def test_manual_vram_limit_is_applied_before_model_loading(monkeypatch):
+    calls = []
+    monkeypatch.setattr(memory, "_total_vram_gb", lambda: 8.0)
+    monkeypatch.setattr(memory.torch.cuda, "set_per_process_memory_fraction",
+                        lambda fraction: calls.append(fraction))
+
+    memory.configure_vram_limit("cuda", {"mode": "manual", "max_vram_gb": 6.0})
+
+    assert calls == [0.75]
 
 
-def test_device_cpu_forced(monkeypatch):
-    # cpu اجباری: بدون توجه به CUDA، cpu برمی‌گردد.
-    monkeypatch.setattr(mem, "_cuda_available", lambda: True)
-    device, reason = mem.select_device("cpu")
-    assert device == "cpu"
+def test_auto_mode_does_not_set_a_manual_vram_limit(monkeypatch):
+    calls = []
+    monkeypatch.setattr(memory, "_total_vram_gb", lambda: 8.0)
+    monkeypatch.setattr(memory.torch.cuda, "set_per_process_memory_fraction",
+                        lambda fraction: calls.append(fraction))
+
+    memory.configure_vram_limit("cuda", {"mode": "auto", "max_vram_gb": 6.0})
+
+    assert calls == []

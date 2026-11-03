@@ -1,37 +1,38 @@
-# ---------- مرحلهٔ ۱: خروجی ویدیو ----------
-codec: libx264          # کدک ویدیوی خروجی
-crf: 18                 # کیفیت (عدد کمتر = کیفیت بیشتر)
-preset: fast          # سرعت انکود
-queue_depth: 4          # حداکثر تعداد فریم در هر صف
+# FFmpeg video output settings. The selected container is controlled by --format
+# or inferred from the generated output extension (MKV by default).
+codec: libx264
+crf: 18
+preset: fast
+pixel_format: yuv420p
+audio_codec: copy
 
-# ---------- مرحلهٔ ۲: دستگاه و حافظه ----------
-device: gpu            # auto | gpu | cpu
+# Maximum number of decoded/processed frames held in each RAM queue.
+queue_depth: 4
+
+device: auto # auto | gpu | cpu
+
 memory:
-  mode: auto            # auto (خودکار) | manual (سقف‌های دستی)
+  mode: auto # auto | manual
   safety_margin_ram: 0.15
-  safety_margin_vram: 0.20
-  max_ram_gb: 0.0       # فقط در حالت manual
-  max_vram_gb: 0.0      # فقط در حالت manual
-  prefetch_depth: 2
-  prefetch_depth_max: 8
-  tile_size: 0
-  batch_size: 1
-  batch_size_max: 8
+  max_ram_gb: 0.0 # manual mode only
+  max_vram_gb: 0.0 # manual mode only; 0 means no PyTorch allocator limit
+  prefetch_depth: 2 # manual queue depth
+  prefetch_depth_max: 8 # maximum queue depth in auto mode
+  tile_size: 0 # 0 = use each model stage's tile_size
+  batch_size: 2 # initial number of tiles sent to the model together
+  batch_size_max: 4 # hard cap for model-stage batch settings
 
-# ---------- زنجیرهٔ مراحل (به ترتیب اجرا می‌شوند) ----------
+# Stages run in order. A model's scale is detected from its architecture.
 stages:
-  # - name: identity      # فقط عبور فریم (برای تست لوله)
+  - name: model
+    model: ./models/1xDeJPG_OmniSR.pth
+    tile_size: 192
+    tile_pad: 16
+    half: false # true enables FP16 on supported CUDA models
 
-# نمونهٔ یک مرحلهٔ مدل (بعد از نصب مدل، خط identity را با این جایگزین کن):
- - name: model
-   model: ./models/1xDeJPG_OmniSR.pth
-   tile_size: 192
-   tile_pad: 16
+# Example second stage:
 #  - name: model
-  #  model: ./models/1x-Debandurh-FS-Ultra-lite.pth
-  #  tile_size: 192
-  #  tile_pad: 16
-#  - name: model
-  #  model: ./models/realesr-general-wdn-x4v3.pth
-  #  tile_size: 192
-  #  tile_pad: 16
+#    model: ./models/realesr-general-x4v3.pth
+#    tile_size: 192
+#    tile_pad: 16
+#    half: true

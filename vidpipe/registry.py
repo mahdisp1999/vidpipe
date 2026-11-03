@@ -1,27 +1,19 @@
-"""Stage registry: plain dict mapping stage name -> stage class.
-
-# ثبات مرحله: نگاشت سادهٔ نام مرحله به کلاس آن. بدون کشف خودکار یا پلاگین.
-"""
+"""Map configured stage names to their implementation classes."""
 
 from __future__ import annotations
-
-from typing import Dict, Type
 
 from .stages.base import Stage
 from .stages.identity import IdentityStage
 from .stages.model import ModelStage
 
-STAGES: Dict[str, Type[Stage]] = {
+STAGES: dict[str, type[Stage]] = {
     "identity": IdentityStage,
     "model": ModelStage,
 }
 
 
-def resolve(name: str) -> Type[Stage]:
-    """Return the stage class for a name, raising a clear error if unknown.
-
-    # کلاس مرحله را برای یک نام برمی‌گرداند؛ اگر ناشناس باشد خطای واضح می‌دهد.
-    """
-    if name not in STAGES:
-        raise ValueError(f"unknown stage: {name!r} (known: {sorted(STAGES)})")
-    return STAGES[name]
+def resolve(name: str) -> type[Stage]:
+    try:
+        return STAGES[name]
+    except KeyError as error:
+        raise ValueError(f"unknown stage {name!r}; known stages: {sorted(STAGES)}") from error

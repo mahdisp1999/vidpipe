@@ -1,123 +1,182 @@
-"""ffmpeg-based input/output wrappers for raw rgb24 frames.
-
-پوشش ورودی/خروجی ویدیو با subprocess های ffmpeg. فریم‌ها فقط در RAM جریان دارند.
-"""
+"""FFmpeg input/output helpers; frames move through memory as raw RGB24."""
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
-import sys
-from typing import Optional, Tuple
+from typing import Optional
 
 
 class VideoReader:
-    """Reads raw rgb24 frames from an ffmpeg decode subprocess.
+    """Decode video frames with FFmpeg and expose basic ffprobe metadata."""
 
-    # خوانندهٔ فریم: ffprobe ابعاد و fps را تشخیص می‌دهد؛ ffmpeg خروجی rgb24 می‌دهد.
-    # اگر ورودی VFR باشد، با -vsync cfr به CFR اجبار می‌شود.
-    """
-
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, input_format: Optional[str] = None, decoder: Optional[str] = None):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"input video not found: {path}")
         self.path = path
-        self.width, self.height, self.fps = self._probe(path)
+        self._reached_eof = False
+        self.width, self.height, self.fps, self.duration, self.total_frames, self.exact_frame_count, self.codec = self._probe(path)
         self.frame_size = self.width * self.height * 3
-        # forces CFR on decode if source is VFR
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
+
+        command = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+        if input_format:
+            command += ["-f", input_format]
+        if decoder:
+            command += ["-c:v", decoder]
+        command += [
             "-i", path,
             "-vsync", "cfr",
-            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
             "pipe:1",
         ]
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.command = command
+        self.proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=None)
 
     @staticmethod
-    def _probe(path: str) -> Tuple[int, int, float]:
-        # خواندن ابعاد و نرخ فریم با ffprobe؛ VFR با r_frame_rate/fps تشخیص داده می‌شود.
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate",
-             "-of", "json", path],
-            capture_output=True, text=True, check=True,
-        )
-        info = json.loads(out.stdout)
-        s = info["streams"][0]
-        w, h = int(s["width"]), int(s["height"])
-        # prefer avg_frame_rate for VFR detection, fall back to r_frame_rate
-        rr = s.get("r_frame_rate", "0/1")
-        ar = s.get("avg_frame_rate", rr)
-        num, den = (rr.split("/") + ["1"])[:2]
-        r_fps = float(num) / float(den) if float(den) else 0.0
-        num2, den2 = (ar.split("/") + ["1"])[:2]
-        a_fps = float(num2) / float(den2) if float(den2) else 0.0
-        # if rates differ -> VFR; CFR handling done in decode via -vsync cfr
-        fps = a_fps if a_fps > 0 else r_fps
+    def _probe(path: str) -> tuple[int, int, float, float, Optional[int], bool, str]:
+        command = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries",
+            "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,duration,codec_name:format=duration",
+            "-of", "json", path,
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        info = json.loads(result.stdout)
+        streams = info.get("streams") or []
+        if not streams:
+            raise RuntimeError(f"no video stream found in {path!r}")
+        stream = streams[0]
+
+        width, height = int(stream["width"]), int(stream["height"])
+
+        def parse_rate(value: str | None) -> float:
+            if not value or value in ("N/A", "0/0"):
+                return 0.0
+            try:
+                numerator, denominator = (value.split("/") + ["1"])[:2]
+                denominator_value = float(denominator)
+                return float(numerator) / denominator_value if denominator_value else 0.0
+            except (TypeError, ValueError, ZeroDivisionError):
+                return 0.0
+
+        average_fps = parse_rate(stream.get("avg_frame_rate"))
+        nominal_fps = parse_rate(stream.get("r_frame_rate"))
+        fps = average_fps or nominal_fps
         if fps <= 0:
-            raise RuntimeError("could not probe fps")
-        return w, h, fps
+            raise RuntimeError("ffprobe could not determine a valid video frame rate")
+
+        duration_value = stream.get("duration") or (info.get("format") or {}).get("duration")
+        duration = float(duration_value) if duration_value not in (None, "N/A") else 0.0
+        raw_count = stream.get("nb_frames")
+
+        # FFmpeg decodes this pipeline as CFR. If the average and nominal
+        # rates differ, nb_frames may not equal the number of frames emitted
+        # after CFR normalization, so show an estimate instead of false precision.
+        variable_rate = bool(
+            average_fps and nominal_fps
+            and abs(average_fps - nominal_fps) > max(1e-6, nominal_fps * 0.001)
+        )
+        exact = raw_count not in (None, "N/A", "0") and not variable_rate
+        total_frames = int(raw_count) if exact else (round(duration * fps) if duration > 0 else None)
+        return width, height, fps, duration, total_frames, exact, stream.get("codec_name", "unknown")
 
     def read_frame(self) -> Optional[bytes]:
-        # یک فریم rgb24 می‌خواند؛ None در پایان جریان.
         if self.proc.stdout is None:
             return None
         data = self.proc.stdout.read(self.frame_size)
-        if len(data) < self.frame_size:
+        if not data:
+            self._reached_eof = True
             return None
+        if len(data) != self.frame_size:
+            raise RuntimeError(
+                f"decoder returned an incomplete frame ({len(data)} of {self.frame_size} bytes)"
+            )
         return data
 
-    def close(self) -> None:
-        # بستن pipe و انتظار برای خروج ffmpeg (بدون kill).
-        if self.proc.stdout:
+    def close(self, allow_incomplete: bool = False) -> None:
+        if self.proc.stdout and not self.proc.stdout.closed:
             self.proc.stdout.close()
-        self.proc.wait()
+        return_code = self.proc.wait()
+        if return_code not in (0, None) and not (allow_incomplete and not self._reached_eof):
+            raise RuntimeError(f"FFmpeg decoder exited with code {return_code}")
 
 
 class VideoWriter:
-    """Writes raw rgb24 frames to an ffmpeg encoder subprocess.
+    """Encode RGB24 frames; copy the source audio stream unless disabled."""
 
-    # نویسندهٔ فریم: فریم‌های rgb24 به stdin ffmpeg داده می‌شوند.
-    # صدا از فایل منبع به عنوان ورودی دوم با -map 1:a? -c:a copy کپی می‌شود.
-    # هیچ فایل موقتی ساخته نمی‌شود.
-    """
-
-    def __init__(self, out_path: str, width: int, height: int, fps: float,
-                 codec: str, crf: int, preset: str, source_path: str) -> None:
+    def __init__(
+        self,
+        out_path: str,
+        width: int,
+        height: int,
+        fps: float,
+        codec: str,
+        crf: Optional[int],
+        preset: str,
+        source_path: str,
+        pixel_format: str = "yuv420p",
+        audio_codec: str = "copy",
+        output_format: Optional[str] = None,
+        video_options: Optional[list[tuple[str, str]]] = None,
+        overwrite: bool = False,
+    ) -> None:
         self.out_path = out_path
         self.width = width
         self.height = height
         self.fps = fps
         self.frame_size = width * height * 3
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y" if overwrite else "-n",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{width}x{height}", "-r", repr(fps),
             "-i", "pipe:0",
             "-i", source_path,
-            "-map", "0:v", "-map", "1:a?",
-            "-c:v", codec, "-crf", str(crf), "-preset", preset,
-            "-c:a", "copy",
-            "-shortest",
-            out_path,
+            "-map", "0:v",
+            "-c:v", codec,
+            "-preset", preset,
+            "-pix_fmt", pixel_format,
         ]
-        # codec/crf/preset are config-driven, not hard-coded (only libx264 required this step).
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        if crf is not None:
+            command += ["-crf", str(crf)]
+        for key, value in video_options or []:
+            command += [f"-{key}", value]
+
+        if audio_codec.lower() == "none":
+            command += ["-an"]
+        else:
+            command += ["-map", "1:a?", "-c:a", audio_codec]
+
+        command += ["-shortest"]
+        if output_format:
+            command += ["-f", output_format]
+        command.append(out_path)
+        self.command = command
+        self.proc = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=None)
 
     def write_frame(self, data: bytes) -> None:
-        # ارسال یک فریم به stdin encoder.
-        if self.proc.stdin is None:
-            raise RuntimeError("encoder stdin closed")
+        if self.proc.stdin is None or self.proc.stdin.closed:
+            raise RuntimeError("FFmpeg encoder input is closed")
+        if len(data) != self.frame_size:
+            raise ValueError(f"writer expected {self.frame_size} bytes, received {len(data)}")
         self.proc.stdin.write(data)
 
     def close(self) -> None:
-        # بستن stdin و انتظار برای خروج ffmpeg (بدون kill) تا MKV معتبر بماند.
-        if self.proc.stdin:
-            self.proc.stdin.close()
-        self.proc.wait()
-        # propagate encoder errors
-        err = self.proc.stderr.read() if self.proc.stderr else b""
-        if self.proc.returncode not in (0, None) and err:
-            sys.stderr.write(err.decode(errors="replace"))
+        close_error = None
+        if self.proc.stdin and not self.proc.stdin.closed:
+            try:
+                self.proc.stdin.close()
+            except BrokenPipeError as error:
+                close_error = error
+        return_code = self.proc.wait()
+        if return_code not in (0, None):
+            raise RuntimeError(
+                f"FFmpeg encoder exited with code {return_code}; output may be incomplete"
+            ) from close_error
+        if close_error is not None:
+            raise close_error
 
     @property
     def returncode(self) -> Optional[int]:

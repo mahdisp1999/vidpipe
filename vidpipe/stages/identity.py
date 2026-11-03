@@ -1,28 +1,21 @@
-"""Identity stage: pass-through, used for testing the pipeline.
-
-# مرحلهٔ هویت: فریم را بدون تغییر عبور می‌دهد؛ برای تست لولهٔ پردازش.
-"""
+"""Pass-through stage used for testing the reader/writer pipeline."""
 
 from __future__ import annotations
 
-from typing import Any, List
+from typing import Any
 
 from .base import Frame, FrameSpec, Stage
 
 
 class IdentityStage(Stage):
+    output_label = "identity"
+    is_denoise = False
+
     def load(self, device: str, params: Any) -> None:
-        # هویت هیچ منبعی بارگذاری نمی‌کند.
         pass
 
-    def plan(self, src_spec: FrameSpec) -> FrameSpec:
-        # خروجی همان ورودی است.
-        return src_spec
+    def plan(self, source_spec: FrameSpec) -> FrameSpec:
+        return source_spec
 
-    def push(self, frame: Frame) -> List[Frame]:
-        # عبور مستقیم فریم.
+    def push(self, frame: Frame) -> list[Frame]:
         return [frame]
-
-    def flush(self) -> List[Frame]:
-        # هیچ فریم بافری وجود ندارد.
-        return []

@@ -1,31 +1,22 @@
-"""Controller state transition tests."""
+import pytest
 
 from vidpipe.controller import Controller, State, StateError
 
 
-def test_invalid_pause_idle():
-    c = Controller()
-    try:
-        c.pause()
-        assert False
-    except StateError:
-        pass
-    assert c.state == State.IDLE
+def test_pause_is_rejected_while_idle():
+    controller = Controller()
+    with pytest.raises(StateError):
+        controller.pause()
+    assert controller.state == State.IDLE
 
 
-def test_invalid_resume_idle():
-    c = Controller()
-    try:
-        c.resume()
-        assert False
-    except (StateError, Exception):
-        pass
+def test_resume_is_rejected_while_idle():
+    controller = Controller()
+    with pytest.raises(StateError):
+        controller.resume()
 
 
-def test_start_requires_idle():
-    # can't start twice
-    pass
-
-
-def test_states_enum():
-    assert State.IDLE.name == "IDLE"
+def test_stop_is_rejected_while_idle():
+    controller = Controller()
+    with pytest.raises(StateError):
+        controller.stop()

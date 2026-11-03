@@ -1,37 +1,24 @@
-"""Device selection and memory derivation (auto and manual modes).
-
-# انتخاب دستگاه و استنتاج حافظه (حالت خودکار و دستی).
-# auto: CUDA اگر موجود باشد، وگرنه CPU با هشدار. gpu: اگر CUDA نباشد خطا می‌دهد.
-# torch اختیاری است؛ اگر نصب نباشد، کد به CPU برمی‌گردد بدون کرش.
-"""
+"""Device selection, bounded frame-queue sizing and GPU memory telemetry."""
 
 from __future__ import annotations
 
 import logging
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 log = logging.getLogger(__name__)
-
-# تلاش برای وارد کردن torch؛ اگر نصب نباشد، CUDA در دسترس نیست.
-try:
-    import torch  # type: ignore
-    _HAS_TORCH = True
-except ImportError:  # pragma: no cover - torch نصب نیست
-    torch = None  # type: ignore
-    _HAS_TORCH = False
-
-_RAM_MARGIN_GB = 1.2  # حاشیهٔ ثابت RAM (گیگابایت)
 _GB = 1024 ** 3
+_FIXED_RAM_MARGIN_GB = 1.2
+
+try:
+    import torch
+except ImportError:  # PyTorch is needed only for model stages and CUDA telemetry.
+    torch = None
 
 
 @dataclass
 class MemoryPlan:
-    """Chosen device and memory values for the whole run.
-
-    # مقادیر انتخاب‌شدهٔ دستگاه و حافظه برای کل اجرا.
-    """
     device: str
     device_reason: str
     free_ram_gb: float
@@ -44,150 +31,153 @@ class MemoryPlan:
 
 
 def _free_ram_gb() -> float:
-    """Free RAM in GB, reading /proc/meminfo (Linux).
-
-    # RAM آزاد بر حسب گیگابایت؛ از /proc/meminfo خوانده می‌شود.
-    """
+    """Read available RAM on Linux; return zero when the OS value is unavailable."""
     try:
-        with open("/proc/meminfo", "r", encoding="utf-8") as f:
-            for line in f:
+        with open("/proc/meminfo", "r", encoding="utf-8") as file:
+            for line in file:
                 if line.startswith("MemAvailable:"):
-                    kb = int(line.split()[1])
-                    return kb * 1024 / _GB
-    except OSError:
+                    return int(line.split()[1]) * 1024 / _GB
+    except (OSError, ValueError):
         pass
-    # fallback: psutil اگر موجود باشد
-    try:
-        import psutil  # type: ignore
-        return psutil.virtual_memory().available / _GB
-    except ImportError:
-        return 0.0
+    return 0.0
 
 
 def _cuda_available() -> bool:
-    """True if torch is present and CUDA is available.
-
-    # اگر torch موجود و CUDA در دسترس باشد True برمی‌گرداند.
-    """
-    return bool(_HAS_TORCH and torch is not None and torch.cuda.is_available())
+    return bool(torch is not None and torch.cuda.is_available())
 
 
 def _free_vram_gb() -> Optional[float]:
-    """Free VRAM in GB via torch.cuda.mem_get_info(), or None if no CUDA.
-
-    # VRAM آزاد بر حسب گیگابایت؛ اگر CUDA نباشد None.
-    """
     if not _cuda_available():
         return None
-    free, _total = torch.cuda.mem_get_info()  # type: ignore
-    return free / _GB
+    try:
+        free, _total = torch.cuda.mem_get_info()
+        return free / _GB
+    except Exception:  # A telemetry failure must not stop video processing.
+        return None
 
 
 def _total_vram_gb() -> Optional[float]:
-    """Total VRAM in GB, or None if no CUDA.
-
-    # کل VRAM بر حسب گیگابایت؛ اگر CUDA نباشد None.
-    """
     if not _cuda_available():
         return None
-    return torch.cuda.get_device_properties(0).total_memory / _GB  # type: ignore
+    try:
+        return torch.cuda.get_device_properties(0).total_memory / _GB
+    except Exception:
+        return None
 
 
-def _device_name() -> str:
-    """Human-readable device name.
+def gpu_memory_stats() -> Optional[dict[str, float]]:
+    """Return free, total, allocated and reserved VRAM using PyTorch only."""
+    if not _cuda_available():
+        return None
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        return {
+            "free_gb": free_bytes / _GB,
+            "total_gb": total_bytes / _GB,
+            "allocated_gb": torch.cuda.memory_allocated() / _GB,
+            "reserved_gb": torch.cuda.memory_reserved() / _GB,
+        }
+    except Exception:
+        return None
 
-    # نام قابل‌خواندن دستگاه.
-    """
+
+def device_name() -> str:
     if _cuda_available():
-        return torch.cuda.get_device_name(0)  # type: ignore
-    return "cpu"
+        try:
+            return torch.cuda.get_device_name(0)
+        except Exception:
+            return "NVIDIA GPU"
+    return "CPU"
 
 
-def select_device(device: str) -> Tuple[str, str]:
-    """Resolve the requested device to an actual device + reason.
-
-    # دستگاه درخواستی را به دستگاه واقعی + دلیل تبدیل می‌کند.
-    # auto: CUDA اگر موجود، وگرنه CPU با هشدار. gpu: بدون CUDA خطا. cpu: اجباری.
-    """
+def select_device(requested: str) -> tuple[str, str]:
     cuda = _cuda_available()
-    if device == "auto":
+    if requested == "auto":
         if cuda:
-            return "cuda", "auto: CUDA available"
-        log.warning("auto: CUDA not available, falling back to CPU")
-        return "cpu", "auto: CUDA unavailable, CPU fallback"
-    if device == "gpu":
+            return "cuda", "CUDA is available"
+        log.warning("CUDA is not available; using CPU")
+        return "cpu", "CUDA is not available"
+    if requested == "gpu":
         if not cuda:
-            raise RuntimeError("device 'gpu' requested but CUDA is not available")
-        return "cuda", "gpu: requested"
-    if device == "cpu":
-        return "cpu", "cpu: requested"
-    raise ValueError(f"invalid device: {device!r} (expected auto|gpu|cpu)")
+            raise RuntimeError("GPU was requested, but PyTorch cannot access CUDA")
+        return "cuda", "GPU was requested"
+    if requested == "cpu":
+        return "cpu", "CPU was requested"
+    raise ValueError(f"invalid device: {requested!r}")
 
 
-def _clamp_depth(depth: int, lo: int, hi: int) -> int:
-    """Clamp depth into [lo, hi].
+def _clamp_depth(value: int, maximum: int) -> int:
+    return max(1, min(value, maximum))
 
-    # عمق را در بازهٔ [lo, hi] محدود می‌کند.
+
+def configure_vram_limit(device: str, memory: dict) -> None:
+    """Apply an optional PyTorch VRAM cap before model weights are loaded."""
+    limit_gb = memory["max_vram_gb"] if memory["mode"] == "manual" else 0.0
+    if device != "cuda" or not limit_gb:
+        return
+
+    total_gb = _total_vram_gb()
+    if not total_gb:
+        log.warning("could not read total VRAM; skipping the configured VRAM limit")
+        return
+
+    fraction = min(1.0, limit_gb / total_gb)
+    torch.cuda.set_per_process_memory_fraction(fraction)
+    log.info("PyTorch CUDA allocator limit set to %.2f GB (%.1f%% of GPU memory)",
+             min(limit_gb, total_gb), fraction * 100)
+
+
+def derive_memory_plan(config: dict, source_spec, output_spec) -> MemoryPlan:
+    """Choose a safe frame-queue depth from available RAM.
+
+    The optional PyTorch VRAM allocator limit is set separately before model
+    loading. ModelStage handles runtime CUDA OOM by reducing tile batches and
+    tile size; this function only sizes the RAM-side queues and reports VRAM.
     """
-    return max(lo, min(hi, depth))
-
-
-def derive_memory_plan(cfg: dict, src_spec, out_spec) -> MemoryPlan:
-    """Derive the memory plan from config (auto or manual).
-
-    # برنامهٔ حافظه را از پیکربندی (خودکار یا دستی) استنتاج می‌کند.
-    """
-    device, reason = select_device(cfg["device"])
+    device, reason = select_device(config["device"])
     free_ram = _free_ram_gb()
     free_vram = _free_vram_gb()
     total_vram = _total_vram_gb()
-    mode = cfg["memory"]["mode"]
+    memory = config["memory"]
 
-    if mode == "manual":
-        # حالت دستی: مقادیر پیکربندی سقف سخت هستند.
-        depth = cfg["memory"]["prefetch_depth"]
-        ram_pool = cfg["memory"]["max_ram_gb"]
+    if memory["mode"] == "manual":
+        depth = memory["prefetch_depth"]
+        ram_pool = memory["max_ram_gb"]
         queue_budget = ram_pool
-        if device == "cuda" and cfg["memory"]["max_vram_gb"] and total_vram:
-            # سقف VRAM دستی: کسر حافظهٔ فرایند را تنظیم می‌کند.
-            torch.cuda.set_per_process_memory_fraction(  # type: ignore
-                cfg["memory"]["max_vram_gb"] / total_vram)
+
+        # In manual mode, max_ram_gb is an optional total budget for both
+        # queues together. One queue slot consists of one input and one output
+        # frame, so this gives a conservative queue-depth limit.
+        if ram_pool > 0:
+            frame_bytes = source_spec.frame_size + output_spec.frame_size
+            slot_gb = frame_bytes / _GB
+            if slot_gb:
+                depth = min(depth, max(1, int(ram_pool / slot_gb)))
+
     else:
-        # حالت خودکار: فرمول‌های حاشیهٔ امن.
-        margin_ram = cfg["memory"]["safety_margin_ram"]
-        margin_vram = cfg["memory"]["safety_margin_vram"]
-        ram_pool = free_ram * (1 - margin_ram) - _RAM_MARGIN_GB
-        queue_budget = 0.5 * ram_pool
-        slot_dec = src_spec.frame_size / _GB
-        slot_enc = out_spec.frame_size / _GB
-        denom = slot_dec + slot_enc
-        depth = _clamp_depth(
-            int(math.floor(queue_budget / denom)) if denom > 0 else 2,
-            2, cfg["memory"]["prefetch_depth_max"])
-        # vram_pool محاسبه می‌شود ولی در این مرحله فقط برای لاگ است.
-        vram_pool = (free_vram * (1 - margin_vram)
-                     if free_vram is not None else 0.0)
-        log.info("auto vram_pool=%.2f GB (context/weights estimates deferred)", vram_pool)
+        ram_pool = max(0.0, free_ram * (1 - memory["safety_margin_ram"]) - _FIXED_RAM_MARGIN_GB)
+        queue_budget = ram_pool * 0.5
+        frame_bytes = source_spec.frame_size + output_spec.frame_size
+        slot_gb = frame_bytes / _GB
+        estimated_depth = int(math.floor(queue_budget / slot_gb)) if slot_gb else 2
+        depth = _clamp_depth(estimated_depth, memory["prefetch_depth_max"])
 
     plan = MemoryPlan(
-        device=device, device_reason=reason,
-        free_ram_gb=free_ram, free_vram_gb=free_vram, total_vram_gb=total_vram,
-        mode=mode, ram_pool_gb=ram_pool, queue_budget_gb=queue_budget,
+        device=device,
+        device_reason=reason,
+        free_ram_gb=free_ram,
+        free_vram_gb=free_vram,
+        total_vram_gb=total_vram,
+        mode=memory["mode"],
+        ram_pool_gb=ram_pool,
+        queue_budget_gb=queue_budget,
         depth=depth,
     )
-    _log_plan(plan)
+    log.info("device=%s (%s), name=%s", device, reason, device_name())
+    log.info("RAM available=%.2f GB; VRAM free=%s; total=%s",
+             free_ram,
+             f"{free_vram:.2f} GB" if free_vram is not None else "n/a",
+             f"{total_vram:.2f} GB" if total_vram is not None else "n/a")
+    log.info("memory mode=%s; queue-depth ceiling=%d; configured RAM queue budget=%.2f GB",
+             plan.mode, plan.depth, plan.queue_budget_gb)
     return plan
-
-
-def _log_plan(plan: MemoryPlan) -> None:
-    """Log every chosen value and the mode once at startup.
-
-    # همهٔ مقادیر انتخاب‌شده و حالت را یک بار در شروع لاگ می‌کند.
-    """
-    log.info("device=%s (%s) name=%s", plan.device, plan.device_reason, _device_name())
-    log.info("free_ram=%.2f GB free_vram=%s total_vram=%s",
-             plan.free_ram_gb,
-             f"{plan.free_vram_gb:.2f} GB" if plan.free_vram_gb is not None else "n/a",
-             f"{plan.total_vram_gb:.2f} GB" if plan.total_vram_gb is not None else "n/a")
-    log.info("mode=%s ram_pool=%.2f GB queue_budget=%.2f GB depth=%d",
-             plan.mode, plan.ram_pool_gb, plan.queue_budget_gb, plan.depth)

@@ -1,15 +1,11 @@
-"""مرحلهٔ مدل: یک فایل .pth را با spandrel لود و روی هر فریم اجرا می‌کند.
-
-تایلینگ: تصویر را تکه‌تکه (کاشی) به مدل می‌دهیم تا حافظه کم مصرف شود.
-برای این‌که مرز کاشی‌ها درز نداشته باشد، کل تصویر یک‌بار با حاشیه (padding)
-بزرگ می‌شود. هر کاشی همراه پیکسل‌های همسایه‌اش به مدل داده می‌شود و بعد
-از اجرا، حاشیهٔ اضافه بریده می‌شود.
-"""
+"""PyTorch/Spandrel image-model stage with batched tiling and CUDA OOM recovery."""
 
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Optional
+import os
+import re
+from typing import Any, Optional
 
 import numpy as np
 
@@ -17,130 +13,235 @@ from .base import Frame, FrameSpec, Stage
 
 log = logging.getLogger(__name__)
 
-# torch و spandrel اختیاری‌اند؛ بدونشان فقط این مرحله قابل استفاده نیست.
 try:
     import torch
     import torch.nn.functional as F
     from spandrel import ImageModelDescriptor, ModelLoader
-    _HAS_TORCH = True
-except ImportError:  # pragma: no cover
-    torch = None  # type: ignore
-    F = None  # type: ignore
-    ImageModelDescriptor = None  # type: ignore
-    ModelLoader = None  # type: ignore
-    _HAS_TORCH = False
+except ImportError:  # The identity-only pipeline can still run without model packages.
+    torch = None
+    F = None
+    ImageModelDescriptor = None
+    ModelLoader = None
 
 
 class ModelStage(Stage):
-    """یک مدل را روی هر فریم با تایلینگ اجرا می‌کند؛ resize خروجی اختیاری است."""
+    """Apply one image model to each frame, splitting large frames into tiles."""
 
     def __init__(self) -> None:
         self.model: Optional[Any] = None
         self.device = "cpu"
+        self.model_path = ""
+        self.model_name = "model"
+        self.output_label = "model"
+        self.is_denoise = False
         self.scale = 1
-        self.tile_size = 512
+        self.tile_size = 192
         self.tile_pad = 16
+        self.batch_size = 1
+        self.batch_size_max = 1
         self.output_scale: Optional[float] = None
         self.half = False
+        self.tiles_completed = 0
+        self.tiles_total = 0
+        self.last_batch_size = 1
+        self.oom_retries = 0
+        self.is_processing = False
 
     def load(self, device: str, params: Any) -> None:
-        """مدل را یک‌بار بارگذاری می‌کند و روی دستگاه می‌برد."""
-        if not _HAS_TORCH:
-            raise RuntimeError("torch and spandrel are required to run model stages")
+        """Load weights once and apply safe, validated runtime settings."""
+        if torch is None or ModelLoader is None:
+            raise RuntimeError("PyTorch and spandrel are required for model stages")
+
         self.device = device
-        self.tile_size = int(params.get("tile_size", 512))
+        self.model_path = str(params["model"])
+        self.model_name = os.path.splitext(os.path.basename(self.model_path))[0]
+        self.output_label = self.model_name
+        self.is_denoise = bool(re.search(r"denois|\bwdn\b|noise.?reduc", self.model_name, re.I))
+        self.tile_size = int(params.get("tile_size", 192))
         self.tile_pad = int(params.get("tile_pad", 16))
+        self.batch_size_max = max(1, int(params.get("batch_size_max", 4)))
+        self.batch_size = min(max(1, int(params.get("batch_size", 1))), self.batch_size_max)
         self.output_scale = params.get("output_scale")
         self.half = bool(params.get("half", False))
 
-        model_path = params["model"]
-        # spandrel معماری مدل را از روی وزن‌ها تشخیص می‌دهد.
-        desc = ModelLoader().load_from_file(model_path)
-        if not isinstance(desc, ImageModelDescriptor):
-            raise RuntimeError(f"model {model_path!r} is not an image model")
-        self.scale = int(desc.scale)
-        desc.to(device).eval()
-        # fp16 فقط روی CUDA و فقط اگر مدل پشتیبانی کند.
-        if self.half and device == "cuda" and desc.supports_half:
-            desc.half()
-        self.model = desc
-        log.info("model=%s arch=%s scale=%d device=%s loaded once",
-                 model_path, desc.architecture, self.scale, device)
+        descriptor = ModelLoader().load_from_file(self.model_path)
+        if not isinstance(descriptor, ImageModelDescriptor):
+            raise RuntimeError(f"model {self.model_path!r} is not an image model")
 
-    def plan(self, src_spec: FrameSpec) -> FrameSpec:
-        """اندازهٔ خروجی: ورودی × scale مدل، و اگر output_scale بود، ورودی × output_scale."""
+        self.scale = int(descriptor.scale)
+        descriptor.to(device).eval()
+        if self.half and device == "cuda":
+            if descriptor.supports_half:
+                descriptor.half()
+            else:
+                log.warning("model %s does not support FP16; keeping FP32", self.model_name)
+                self.half = False
+
+        self.model = descriptor
+        log.info(
+            "loaded model=%s architecture=%s scale=%dx device=%s precision=%s "
+            "tile=%d batch=%d (max=%d)",
+            self.model_name,
+            descriptor.architecture,
+            self.scale,
+            device,
+            "FP16" if self.half else "FP32",
+            self.tile_size,
+            self.batch_size,
+            self.batch_size_max,
+        )
+
+    def plan(self, source_spec: FrameSpec) -> FrameSpec:
         if self.output_scale is not None:
-            w = int(round(src_spec.width * self.output_scale))
-            h = int(round(src_spec.height * self.output_scale))
+            width = int(round(source_spec.width * self.output_scale))
+            height = int(round(source_spec.height * self.output_scale))
         else:
-            w = src_spec.width * self.scale
-            h = src_spec.height * self.scale
-        return FrameSpec(width=w, height=h, fps=src_spec.fps, frame_size=w * h * 3)
+            width = source_spec.width * self.scale
+            height = source_spec.height * self.scale
+        return FrameSpec(width, height, source_spec.fps, width * height * 3)
 
-    def push(self, frame: Frame) -> List[Frame]:
-        """یک فریم rgb24 می‌گیرد و فریم پردازش‌شده برمی‌گرداند."""
-        if self.model is None:
-            raise RuntimeError("model not loaded")
-        h, w = frame.spec.height, frame.spec.width
+    def push(self, frame: Frame) -> list[Frame]:
+        if self.model is None or torch is None:
+            raise RuntimeError("model stage has not been loaded")
 
-        # بایت‌های خام -> تنسور float در بازهٔ 0..1 با شکل (1, 3, H, W)
-        img = np.frombuffer(frame.data, dtype=np.uint8).reshape(h, w, 3).copy()
-        x = torch.from_numpy(img).permute(2, 0, 1).float().div(255.0).unsqueeze(0)
-        x = x.to(self.device)
+        height, width = frame.spec.height, frame.spec.width
+        image = np.frombuffer(frame.data, dtype=np.uint8).reshape(height, width, 3).copy()
+        tensor = torch.from_numpy(image).permute(2, 0, 1).float().div_(255.0).unsqueeze(0)
+        tensor = tensor.to(self.device)
         if self.half and self.device == "cuda":
-            x = x.half()
+            tensor = tensor.half()
 
-        with torch.no_grad():
-            out = self._run_tiled(x)
+        self.is_processing = True
+        try:
+            with torch.inference_mode():
+                output = self._run_tiled(tensor)
 
-        # اگر output_scale داده شده، خروجی به اندازهٔ برنامه‌ریزی‌شده می‌رود.
-        spec = self.plan(frame.spec)
-        if self.output_scale is not None:
-            out = F.interpolate(out, size=(spec.height, spec.width),
-                                mode="bicubic", align_corners=False)
+                output_spec = self.plan(frame.spec)
+                if self.output_scale is not None:
+                    output = F.interpolate(
+                        output,
+                        size=(output_spec.height, output_spec.width),
+                        mode="bicubic",
+                        align_corners=False,
+                    )
 
-        # float -> uint8 با گرد کردن (نه قطع کردن) تا رنگ‌ها تیره‌تر نشوند.
-        out = out.float().squeeze(0).clamp(0.0, 1.0).mul(255.0).round().byte()
-        data = out.permute(1, 2, 0).contiguous().cpu().numpy().tobytes()
-        return [Frame(data=data, spec=spec)]
+                output = output.float().squeeze(0).clamp(0.0, 1.0).mul(255.0).round().byte()
+                # This is the one required GPU-to-CPU hand-off for the completed frame.
+                data = output.permute(1, 2, 0).contiguous().cpu().numpy().tobytes()
+            return [Frame(data=data, spec=output_spec)]
+        finally:
+            self.is_processing = False
 
-    def _run_tiled(self, x: "torch.Tensor") -> "torch.Tensor":
-        """مدل را روی کاشی‌ها اجرا می‌کند و خروجی کامل را می‌سازد.
+    @staticmethod
+    def _is_cuda_oom(error: RuntimeError) -> bool:
+        return "out of memory" in str(error).lower()
 
-        # چرا کل تصویر را یک‌بار pad می‌کنیم؟
-        # اگر هر کاشی جدا pad شود، لبهٔ کاشی‌ها بازتاب خودِ کاشی می‌شود و
-        # روی مرز درز دیده می‌شود. با pad کردن کل تصویر، هر کاشی پیکسل‌های
-        # واقعی همسایه را می‌بیند.
-        """
-        _, c, h, w = x.shape
-        s = self.scale
+    def _run_tiled(self, tensor: "torch.Tensor") -> "torch.Tensor":
+        """Retry with a smaller batch, then smaller tiles, after a CUDA OOM."""
+        tile_size = self.tile_size
+        batch_size = self.batch_size
+
+        while True:
+            try:
+                result = self._run_tiled_once(tensor, tile_size, batch_size)
+                self.tile_size = tile_size
+                self.batch_size = batch_size
+                return result
+            except RuntimeError as error:
+                if self.device != "cuda" or not self._is_cuda_oom(error):
+                    raise
+
+                self.oom_retries += 1
+                if batch_size > 1:
+                    batch_size = max(1, batch_size // 2)
+                    log.warning(
+                        "CUDA out of memory; retrying this frame with tile batch size %d",
+                        batch_size,
+                    )
+                elif tile_size > 64:
+                    tile_size = max(64, tile_size // 2)
+                    log.warning(
+                        "CUDA out of memory at batch size 1; retrying with tile size %d",
+                        tile_size,
+                    )
+                else:
+                    raise RuntimeError(
+                        "CUDA out of memory even with tile_size=64 and batch_size=1. "
+                        "Close other GPU workloads, use a smaller model, or try CPU."
+                    ) from error
+
+                self.tiles_completed = 0
+                self.tiles_total = 0
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+    def _run_tiled_once(
+        self,
+        tensor: "torch.Tensor",
+        tile_size: int,
+        batch_size: int,
+    ) -> "torch.Tensor":
+        """Run equal-shaped tiles together; edge tiles are grouped by shape."""
+        _, channels, height, width = tensor.shape
+        scale = self.scale
         pad = self.tile_pad
-        tile = self.tile_size
 
-        # reflect فقط وقتی کار می‌کند که حاشیه از اندازهٔ تصویر کوچک‌تر باشد.
-        mode = "reflect" if pad < min(h, w) else "replicate"
-        x_pad = F.pad(x, (pad, pad, pad, pad), mode=mode)
+        if pad:
+            pad_mode = "reflect" if pad < min(height, width) and min(height, width) > 1 else "replicate"
+            padded = F.pad(tensor, (pad, pad, pad, pad), mode=pad_mode)
+        else:
+            padded = tensor
 
-        out = torch.zeros((1, c, h * s, w * s), dtype=x.dtype, device=x.device)
-        for y in range(0, h, tile):
-            y_end = min(y + tile, h)
-            for x0 in range(0, w, tile):
-                x_end = min(x0 + tile, w)
-                # کاشی + حاشیهٔ همسایه از تصویر pad‌شده
-                crop = x_pad[:, :, y:y_end + 2 * pad, x0:x_end + 2 * pad]
-                res = self.model(crop)
-                # فقط بخش اصلی کاشی (بدون حاشیه) را برمی‌داریم
-                core = res[:, :, pad * s:pad * s + (y_end - y) * s,
-                           pad * s:pad * s + (x_end - x0) * s]
-                out[:, :, y * s:y_end * s, x0 * s:x_end * s] = core
-        return out
+        output = torch.zeros(
+            (1, channels, height * scale, width * scale),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
 
-    def flush(self) -> List[Frame]:
-        """این مرحله بافر ندارد."""
-        return []
+        # Edge tiles can be smaller. Grouping by crop shape lets torch.cat build
+        # valid batches without padding a second time or wasting extra VRAM.
+        groups: dict[tuple[int, int], list[tuple[int, int, int, int]]] = {}
+        for top in range(0, height, tile_size):
+            bottom = min(top + tile_size, height)
+            for left in range(0, width, tile_size):
+                right = min(left + tile_size, width)
+                shape = (bottom - top + 2 * pad, right - left + 2 * pad)
+                groups.setdefault(shape, []).append((top, bottom, left, right))
+
+        self.tiles_total = sum(len(items) for items in groups.values())
+        self.tiles_completed = 0
+        self.last_batch_size = 1
+
+        for positions in groups.values():
+            for offset in range(0, len(positions), batch_size):
+                batch_positions = positions[offset:offset + batch_size]
+                crops = [
+                    padded[:, :, top:bottom + 2 * pad, left:right + 2 * pad]
+                    for top, bottom, left, right in batch_positions
+                ]
+                batch = crops[0] if len(crops) == 1 else torch.cat(crops, dim=0)
+                predictions = self.model(batch)
+                self.last_batch_size = len(batch_positions)
+
+                for index, (top, bottom, left, right) in enumerate(batch_positions):
+                    tile_output = predictions[index:index + 1]
+                    core = tile_output[
+                        :,
+                        :,
+                        pad * scale:pad * scale + (bottom - top) * scale,
+                        pad * scale:pad * scale + (right - left) * scale,
+                    ]
+                    output[:, :, top * scale:bottom * scale, left * scale:right * scale] = core
+                    self.tiles_completed += 1
+
+        return output
 
     def release(self) -> None:
-        """مدل را آزاد و حافظهٔ CUDA را خالی می‌کند."""
         self.model = None
-        if _HAS_TORCH and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if torch is not None and self.device == "cuda":
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
