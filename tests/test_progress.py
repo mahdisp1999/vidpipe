@@ -1,60 +1,15 @@
-from vidpipe.progress import ProgressReporter, format_duration
+from vidpipe.progress import ProgressReporter, format_duration, format_header
 
 
-def test_format_duration():
-    assert format_duration(3661) == "01:01:01"
-    assert format_duration(None) == "--:--:--"
+class _Buffer:
+    """Fake stream. tty=True mimics a terminal, tty=False mimics a log file."""
 
-
-def test_progress_has_frame_count_and_eta_fields():
-    reporter = ProgressReporter(interval=1, color=False)
-    reporter.started_at -= 5
-    line = reporter.render(
-        {
-            "processed": 10,
-            "total_frames": 100,
-            "exact_frame_count": True,
-            "frames_read": 10,
-        },
-        "RUNNING",
-    )
-    assert "10/100 frames" in line
-    assert "Remaining 90" in line
-    assert "FPS" in line
-    assert "ETA" in line
-
-
-def test_progress_can_color_and_bold_important_fields():
-    reporter = ProgressReporter(interval=1, color=True)
-    line = reporter.render(
-        {"processed": 5, "total_frames": 10, "exact_frame_count": True},
-        "RUNNING",
-    )
-    assert "\033[1m" in line
-    assert "\033[32m" in line or "\033[36m" in line
-
-
-def test_progress_includes_processing_timing():
-    reporter = ProgressReporter(interval=1, color=False)
-    line = reporter.render(
-        {
-            "processed": 2,
-            "total_frames": 10,
-            "exact_frame_count": True,
-            "frames_read": 2,
-            "stage_seconds": 0.8,
-        },
-        "RUNNING",
-    )
-    assert "Decode/Process/Encode 0/400/0 ms/frame" in line
-
-
-class _TerminalBuffer:
-    def __init__(self):
+    def __init__(self, tty=True):
         self.parts = []
+        self._tty = tty
 
     def isatty(self):
-        return True
+        return self._tty
 
     def write(self, value):
         self.parts.append(value)
@@ -63,45 +18,106 @@ class _TerminalBuffer:
         pass
 
 
-def test_progress_redraws_same_terminal_line_and_clears_old_text():
-    stream = _TerminalBuffer()
-    reporter = ProgressReporter(interval=1, color=False, stream=stream)
-    reporter.print_update("first status")
-    reporter.print_update("short", final=True)
-    output = "".join(stream.parts)
-    assert output == "\rfirst status\033[K\rshort\033[K\n"
+def _snapshot(**overrides):
+    base = {
+        "processed": 315,
+        "total_frames": 1000,
+        "exact_frame_count": True,
+        "frames_read": 320,
+        "queue_depth": 4,
+        "input_queue": 2,
+        "output_queue": 1,
+        "tiles_completed": 4,
+        "tiles_total": 12,
+        "tile_size": 192,
+        "tile_batch_size": 2,
+        "model_name": "realesr-general-x4v3",
+        "read_seconds": 0.008,
+        "stage_seconds": 2.7,
+        "write_seconds": 0.012,
+    }
+    base.update(overrides)
+    return base
 
 
-def test_progress_uses_readable_labels_and_detailed_metrics():
+def test_format_duration():
+    assert format_duration(3661) == "01:01:01"
+    assert format_duration(None) == "--:--:--"
+
+
+def test_format_header_aligns_colons():
+    text = format_header([("Input", "x.mp4"), ("Resolution", "1x2")])
+    assert text == "Input      : x.mp4\nResolution : 1x2"
+
+
+def test_panel_has_six_lines_and_exact_percentages():
     reporter = ProgressReporter(interval=1, color=False)
-    line = reporter.render(
-        {
-            "processed": 315,
-            "total_frames": 1000,
-            "exact_frame_count": True,
-            "frames_read": 320,
-            "tiles_completed": 4,
-            "tiles_total": 12,
-            "tile_size": 192,
-            "tile_batch_size": 2,
-            "input_queue": 2,
-            "output_queue": 1,
-            "queue_depth": 4,
-            "model_name": "test-model",
-            "stage_timings": {"1:test-model": 1.2},
-        },
-        "RUNNING",
-    )
-    for expected in ("315/1,000 frames", "Remaining 685 (68.50%)", "FPS",
-                     "Elapsed", "ETA", "Tiles 4/12@192px b2", "Q=2/4,1/4",
-                     "Decode/Process/Encode", "VRAM", "test-model"):
-        assert expected in line
+    reporter.started_at -= 5
+    lines = reporter.render(_snapshot(), "RUNNING").split("\n")
+    assert len(lines) == 6
+    assert "31.50% done" in lines[0]
+    assert "68.50% left" in lines[0]
+    assert "315 / 1,000" in lines[1]
+    assert "685 frames" in lines[1]
 
 
-def test_progress_redraws_one_terminal_line_in_place():
-    stream = _TerminalBuffer()
+def test_percentages_are_exact_for_small_totals():
+    reporter = ProgressReporter(interval=1, color=False)
+    line = reporter.render(_snapshot(processed=1, total_frames=3), "RUNNING").split("\n")[0]
+    assert "33.33% done" in line
+    assert "66.67% left" in line
+
+
+def test_approximate_total_is_marked():
+    reporter = ProgressReporter(interval=1, color=False)
+    lines = reporter.render(_snapshot(exact_frame_count=False), "RUNNING").split("\n")
+    assert "315 / ~1,000" in lines[1]
+    assert "(approx.)" in lines[0]
+
+
+def test_gpu_panel_shows_vram_and_utilization():
+    reporter = ProgressReporter(interval=1, color=False)
+    gpu = {"free_gb": 2.58, "total_gb": 8.0, "allocated_gb": 1.0,
+           "reserved_gb": 1.5, "util_percent": 96}
+    text = reporter.render(_snapshot(), "RUNNING", gpu)
+    assert "5.42 / 8.00 GB" in text
+    assert "96%" in text
+
+
+def test_gpu_utilization_is_na_when_unavailable():
+    reporter = ProgressReporter(interval=1, color=False)
+    text = reporter.render(_snapshot(), "RUNNING", {"free_gb": 2.58, "total_gb": 8.0})
+    assert "GPU" in text and "n/a" in text
+
+
+def test_per_frame_timing_uses_processed_count():
+    reporter = ProgressReporter(interval=1, color=False)
+    lines = reporter.render(_snapshot(processed=2, stage_seconds=2.7), "RUNNING").split("\n")
+    assert "process 1350 ms" in lines[5]
+
+
+def test_oom_line_appears_only_after_retries():
+    reporter = ProgressReporter(interval=1, color=False)
+    assert "OOM" not in reporter.render(_snapshot(), "RUNNING")
+    assert "retries 2" in reporter.render(_snapshot(oom_retries=2), "RUNNING")
+
+
+def test_color_adds_bold_codes():
+    reporter = ProgressReporter(interval=1, color=True)
+    text = reporter.render(_snapshot(), "RUNNING")
+    assert "\033[1m" in text
+
+
+def test_panel_is_redrawn_in_place_on_tty():
+    stream = _Buffer(tty=True)
     reporter = ProgressReporter(interval=1, color=False, stream=stream)
-    reporter.print_update("progress one")
-    reporter.print_update("progress two", final=True)
-    output = "".join(stream.parts)
-    assert output == "\rprogress one\033[K\rprogress two\033[K\n"
+    reporter.print_update("a\nb")
+    reporter.print_update("c\nd", final=True)
+    assert "".join(stream.parts) == "\033[2Ka\n\033[2Kb\n\033[2A\033[2Kc\n\033[2Kd\n"
+
+
+def test_log_output_writes_one_record_per_update():
+    stream = _Buffer(tty=False)
+    reporter = ProgressReporter(interval=1, color=False, stream=stream)
+    reporter.print_update("a\nb")
+    assert "".join(stream.parts) == "a | b\n"

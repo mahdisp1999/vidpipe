@@ -145,22 +145,28 @@ There is no explicit `torch.cuda.synchronize()` in the tile loop. PyTorch queues
 
 ## 8. Progress and performance metrics
 
-`pipeline.py` maintains thread-safe counters for frames read/written, time spent in the reader, stage chain and writer, plus queue occupancy. `ProgressReporter` periodically snapshots these counters and displays:
+`pipeline.py` keeps thread-safe counters (frames read/written, time in the reader, stage chain and writer, queue occupancy). `main.py` takes a snapshot of them at every refresh and passes it, with the run state and GPU telemetry, to `ProgressReporter`.
 
-- processed frames and total frames;
-- percentage and remaining frame count;
-- smoothed FPS, wall elapsed time and ETA;
-- current model tile progress, tile size and last batch size;
-- input/output queue occupancy;
-- average decode, stage and encode milliseconds per frame, plus per-stage averages;
-- PyTorch allocated/reserved/free/total VRAM when CUDA is available;
-- run state and OOM retry count.
+Before processing starts, `ProgressReporter.print_header` prints the static run information once: input, output, resolution, frame count, models, device, precision, codec and queue depth. These values never change during a run, so they are not repeated.
 
-The dashboard is intentionally a **single terminal line**. Each refresh writes `\r`, then the new status and ANSI erase-to-end-of-line (`ESC[K`); it does not move the cursor to a new row. When output is redirected and is not a TTY, one newline-delimited record is emitted per refresh because a log file has no interactive cursor.
+The live output is a **fixed six-line panel**:
 
-If FFprobe exposes `nb_frames` and the nominal and average frame rates agree, the frame count is treated as exact. If the rates differ (a sign of VFR, or variable-frame-rate, content), `duration × average frame rate` is used as an estimate and marked with `~`, because FFmpeg normalizes decoding to CFR (constant-frame-rate). The estimated count may still differ slightly from the number of emitted frames. ETA is an estimate based on observed throughput, not a guarantee.
+1. Status, progress bar, exact done percentage and exact left percentage.
+2. Frames processed / total, and remaining frames.
+3. Smoothed FPS, wall-clock elapsed time and ETA.
+4. Model name, tile progress (tile size and batch) and input/output queue occupancy.
+5. VRAM usage (PyTorch), GPU utilization (NVML), and OOM retry count when non-zero.
+6. Average decode, process and encode milliseconds per frame.
 
-GPU utilization percentage is intentionally not displayed: it would require an additional monitoring dependency or invoking an external monitoring tool. VRAM reporting uses PyTorch only.
+Design rules:
+
+- **One source of truth for percentages.** Done and left percentages are both computed from `processed / total`, so they always sum to 100.
+- **Fixed positions.** Each field has a fixed label width and value width, and padding is applied before ANSI colors, so columns stay aligned.
+- **In-place redraw on a TTY.** `print_update` moves the cursor up by the number of lines drawn last time (`ESC[nA`), then rewrites each line after clearing it (`ESC[2K`). Redirected output gets one record per refresh instead.
+- **Honest estimates.** When the frame count is estimated (variable frame rate), values are marked with `~` and `(approx.)`. ETA is based on smoothed throughput and is not a guarantee.
+- **No forced synchronization.** The reporter reads counters and telemetry only. It never calls `torch.cuda.synchronize()`.
+
+GPU telemetry is split between two sources. VRAM (allocated, reserved, free) comes from PyTorch. GPU utilization comes from NVML through the optional `pynvml` package, read by `memory.gpu_memory_stats`. If `pynvml` is missing or fails, the field shows `n/a` and processing continues. The NVML device index is fixed at 0, so it does not follow `CUDA_VISIBLE_DEVICES`.
 
 ## 9. Output naming and FFmpeg options
 
@@ -187,10 +193,10 @@ The available formats depend on the local FFmpeg build. `--list-encoders`, `--li
 | `controller.py` | Owns the run state and coordinates pause/resume/stop without force-killing worker threads. |
 | `pipeline.py` | Owns the bounded queues, three workers, frame counters, timings and error propagation. |
 | `video_io.py` | Converts source video to fixed-size RGB24 frames and sends output frames to FFmpeg. |
-| `memory.py` | Selects CPU/CUDA, sets an optional PyTorch VRAM limit before model loading, calculates safe RAM queue depth and exposes VRAM telemetry. |
+| `memory.py` | Selects CPU/CUDA, sets an optional PyTorch VRAM limit before model loading, calculates safe RAM queue depth, and reports VRAM (PyTorch) and GPU utilization (NVML, optional). |
 | `naming.py` | Generates descriptive and collision-safe output paths. |
-| `progress.py` | Formats the live progress line and estimates speed/ETA without external UI packages. |
-| `registry.py` | Keeps stage lookup explicit and small. |
+| `progress.py` | Builds the static header and the fixed six-line live panel, and redraws it in place on a TTY (cursor-up plus clear-line) or writes one record per update to a log. |
+| `registry.py` | Selects CPU/CUDA, sets an optional PyTorch VRAM limit before model loading, calculates safe RAM queue depth, and reports VRAM (PyTorch) and GPU utilization (NVML, optional). |
 | `stages/base.py` | Defines the `Frame`, `FrameSpec` and `Stage` contract. |
 | `stages/identity.py` | Returns frames unchanged for pipeline tests. |
 | `stages/model.py` | Loads image models, performs batched tiling, and retries smaller work units after CUDA OOM. |

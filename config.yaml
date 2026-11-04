@@ -1,6 +1,6 @@
 # FFmpeg video output settings. The selected container is controlled by --format
 # or inferred from the generated output extension (MKV by default).
-codec: libx264
+codec: libx264 # av1_nvenc, libx264, libx264rgb, h264_nvenc, libx265
 crf: 18
 preset: fast
 pixel_format: yuv420p
@@ -9,7 +9,7 @@ audio_codec: copy
 # Maximum number of decoded/processed frames held in each RAM queue.
 queue_depth: 4
 
-device: auto # auto | gpu | cpu
+device: gpu # auto | gpu | cpu
 
 memory:
   mode: auto # auto | manual
@@ -25,10 +25,12 @@ memory:
 # Stages run in order. A model's scale is detected from its architecture.
 stages:
   - name: model
-    model: ./models/1xDeJPG_OmniSR.pth
-    tile_size: 192
+    # model: ./models/1xDeJPG_OmniSR.pth
+    # model: ./models/realesr-general-wdn-x4v3.pth
+    model: ./models/realesr-general-x4v3.pth
+    tile_size: 256
     tile_pad: 16
-    half: false # true enables FP16 on supported CUDA models
+    half: True # true enables FP16 on supported CUDA models
 
 # Example second stage:
 #  - name: model

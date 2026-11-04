@@ -4,3 +4,6 @@ pytest
 spandrel
 # Install a PyTorch build matching your CUDA/CPU setup separately (pytorch.org).
 torch
+# GPU utilization (NVML) for the progress panel. Optional at runtime:
+# if missing, the panel shows GPU usage as n/a.
+pynvml

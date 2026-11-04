@@ -97,21 +97,34 @@ If standard input is not an interactive terminal (for example, when input is pip
 
 ## Progress display
 
-The progress reporter updates the **same terminal line** using carriage return (`\r`) and ANSI erase-line (`ESC[K`). It does not create a new line for every refresh.
+After a short header (input, output, resolution, models, device, precision), the run shows a **six-line live panel**. The panel is redrawn in place: the cursor moves up by the panel height (`ESC[nA`) and each line is cleared before being written (`ESC[2K`), so it never scrolls down the terminal.
 
-A typical status line contains:
+Illustrative example:
 
 ```text
-[=======---------------] 31.50% | Frames 315/1,000 | Remaining 685 (68.50%) | 0.35 FPS | Elapsed 00:05:12 | ETA 00:32:41 | Model realesr-general-x4v3 | Tiles 4/12 @ 192px, batch 2 | Queues R 2/4 W 1/4 | Decode/Process/Encode 8/2700/12 ms/frame | VRAM 5.42/8.00 GB | RUNNING
+RUNNING    [██████████░░░░░░░░░░░░░░░░░░░░]  31.50% done   68.50% left
+Frames     315 / 1,000                Remaining  685 frames
+Speed      0.35 fps                   Elapsed    00:15:00    ETA 00:32:37
+Model      realesr-general-x4v3       Tiles      4 / 12 @192px b2
+Queue      in 2/4  out 1/4            VRAM       5.42 / 8.00 GB
+GPU        96%
+Per frame  decode 8 ms | process 2700 ms | encode 12 ms
 ```
 
-The values above are illustrative. Exact frame totals are used when FFprobe provides them; otherwise the total is marked as approximate. FPS is smoothed to reduce jumps, and ETA is based on the smoothed processing rate. When output is redirected to a file or pipe, the reporter emits one plain-text record per update because an in-place terminal redraw is not meaningful in a log.
+Notes:
+
+- The done and left percentages are computed from the same frame count, so they always add up to 100%.
+- A `~` (and `(approx.)`) appears when the frame count is an estimate (for example, for variable-frame-rate input).
+- `Elapsed` is wall-clock time since the run started and includes paused time. `ETA` uses the smoothed speed.
+- `GPU` needs the `pynvml` package (listed in `requirements.txt`). Without it, the field shows `n/a`.
+- The `OOM` field appears only when CUDA out-of-memory recovery has run.
+- When output is redirected to a file or pipe, each refresh is one line with the panel's fields joined by ` | `.
 
 Options:
 
 ```text
 --progress-interval SECONDS   Refresh interval (default: 1.0)
---no-progress                Disable the progress display
+--no-progress                Disable the live panel (the header is still printed)
 --no-color                   Disable ANSI colors
 ```
 

@@ -13,7 +13,7 @@ from . import __version__
 from .config import load_config
 from .controller import Controller, State, StateError
 from .controls import KeyboardControls
-from .memory import configure_vram_limit, derive_memory_plan, gpu_memory_stats, select_device
+from .memory import configure_vram_limit, derive_memory_plan, device_name, gpu_memory_stats, select_device
 from .naming import make_output_path
 from .progress import ProgressReporter
 from .registry import resolve
@@ -104,7 +104,7 @@ Keys work immediately; Enter is not required. Ctrl+C requests a clean stop.
 
     display = parser.add_argument_group("progress display")
     display.add_argument("--progress-interval", type=float, default=1.0, help="seconds between progress updates (default: 1)")
-    display.add_argument("--no-progress", action="store_true", help="disable the live progress line")
+    display.add_argument("--no-progress", action="store_true", help="disable the live progress panel")
     display.add_argument("--no-color", action="store_true", help="disable ANSI colors")
     display.add_argument("--overwrite", action="store_true", help="allow replacing an existing --output file")
 
@@ -215,6 +215,39 @@ def _output_path(args: argparse.Namespace, stages, source_spec: FrameSpec, outpu
     )
 
 
+def _progress_stream():
+    """Prefer stdout when it is a terminal; otherwise use stderr if that is the terminal."""
+    if sys.stdout.isatty():
+        return sys.stdout
+    if sys.stderr.isatty():
+        return sys.stderr
+    return sys.stdout
+
+
+def _header_fields(args, config, reader, output_spec, output_path, device, stages, queue_depth):
+    """Static run information. It is printed once, not on every refresh."""
+    labels = []
+    for stage in stages:
+        label = getattr(stage, "output_label", None)
+        if label and label != "identity":
+            labels.append(str(label))
+    precision = "FP16" if any(getattr(stage, "half", False) for stage in stages) else "FP32"
+    total = reader.total_frames
+    frame_text = f"{'' if reader.exact_frame_count else '~'}{total}" if total else "unknown"
+    return [
+        ("Input", args.input),
+        ("Output", output_path),
+        ("Resolution", f"{reader.width}x{reader.height} -> {output_spec.width}x{output_spec.height}"),
+        ("Frames", frame_text),
+        ("Source FPS", f"{reader.fps:.3f}"),
+        ("Models", " -> ".join(labels) or "identity"),
+        ("Device", f"{device_name()} ({device})"),
+        ("Precision", precision),
+        ("Codec", f"{reader.codec} -> {config['codec']}"),
+        ("Queue depth", str(queue_depth)),
+    ]
+
+
 def _run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     _apply_cli_overrides(config, args)
@@ -254,14 +287,16 @@ def _run(args: argparse.Namespace) -> int:
             overwrite=args.overwrite,
         )
 
-        print(f"[vidpipe] Input : {args.input}", file=sys.stderr)
-        print(f"[vidpipe] Output: {output_path}", file=sys.stderr)
-        print(
-            f"[vidpipe] Video: {reader.width}x{reader.height} @ {reader.fps:.3f} FPS; "
-            f"frames={'~' if not reader.exact_frame_count else ''}{reader.total_frames or 'unknown'}; "
-            f"{reader.codec} -> {config['codec']}; device={device}; "
-            f"queue={effective_queue_depth}",
-            file=sys.stderr,
+        # The reporter and header are created before the pipeline starts, so the
+        # static information is visible first and the live panel starts below it.
+        reporter = ProgressReporter(
+            interval=args.progress_interval,
+            color=False if args.no_color else None,
+            stream=_progress_stream(),
+        )
+        reporter.print_header(
+            _header_fields(args, config, reader, output_spec, output_path,
+                           device, stages, effective_queue_depth)
         )
 
         controller = Controller()
@@ -285,34 +320,16 @@ def _run(args: argparse.Namespace) -> int:
         elif sys.stdin.isatty():
             print("[controls] Interactive single-key input is unavailable; use Ctrl+C to stop.", file=sys.stderr)
 
-        # Prefer stdout when it is a terminal; otherwise use stderr if that is
-        # the interactive terminal (some IDEs redirect stdout separately).
-        if sys.stdout.isatty():
-            progress_stream = sys.stdout
-        elif sys.stderr.isatty():
-            progress_stream = sys.stderr
-        else:
-            progress_stream = sys.stdout
-
-        reporter = ProgressReporter(
-            interval=args.progress_interval,
-            color=False if args.no_color else None,
-            stream=progress_stream,
-        )
         try:
             while True:
                 controller.wait(timeout=args.progress_interval)
                 state_name = controller.state.name
                 snapshot = controller.pipeline.status_snapshot() if controller.pipeline else {}
+                finished = state_name in {"STOPPED", "FINISHED", "FAILED"}
                 if not args.no_progress:
-                    line = reporter.render(
-                        snapshot, state_name, gpu_memory_stats(),
-                        final=state_name in {"STOPPED", "FINISHED", "FAILED"},
-                    )
-                    reporter.print_update(
-                        line, final=state_name in {"STOPPED", "FINISHED", "FAILED"}
-                    )
-                if state_name in {"STOPPED", "FINISHED", "FAILED"}:
+                    line = reporter.render(snapshot, state_name, gpu_memory_stats(), final=finished)
+                    reporter.print_update(line, final=finished)
+                if finished:
                     break
         finally:
             keyboard.close()

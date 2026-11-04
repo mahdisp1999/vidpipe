@@ -16,6 +16,13 @@ try:
 except ImportError:  # PyTorch is needed only for model stages and CUDA telemetry.
     torch = None
 
+try:
+    import pynvml  # اختیاری: فقط برای درصد استفاده‌ی GPU در پنل پیشرفت
+except ImportError:
+    pynvml = None
+
+_nvml_ready = False
+
 
 @dataclass
 class MemoryPlan:
@@ -65,8 +72,28 @@ def _total_vram_gb() -> Optional[float]:
         return None
 
 
+def _gpu_utilization_percent() -> Optional[int]:
+    """درصد استفاده‌ی GPU از NVML.
+
+    NVML در اولین فراخوانی یک‌بار راه‌اندازی می‌شود. اگر pynvml نصب نباشد
+    یا خطایی رخ دهد، None برمی‌گرداند تا پنل پیشرفت کرش نکند.
+    """
+    global _nvml_ready
+    if pynvml is None:
+        return None
+    try:
+        if not _nvml_ready:
+            pynvml.nvmlInit()
+            _nvml_ready = True
+        # ایندکس 0 همان GPU ای است که PyTorch استفاده می‌کند (با فرض نبودن CUDA_VISIBLE_DEVICES).
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        return int(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
+    except Exception:
+        return None
+
+
 def gpu_memory_stats() -> Optional[dict[str, float]]:
-    """Return free, total, allocated and reserved VRAM using PyTorch only."""
+    """Return VRAM figures from PyTorch and GPU utilization from NVML (if available)."""
     if not _cuda_available():
         return None
     try:
@@ -76,6 +103,7 @@ def gpu_memory_stats() -> Optional[dict[str, float]]:
             "total_gb": total_bytes / _GB,
             "allocated_gb": torch.cuda.memory_allocated() / _GB,
             "reserved_gb": torch.cuda.memory_reserved() / _GB,
+            "util_percent": _gpu_utilization_percent(),
         }
     except Exception:
         return None
