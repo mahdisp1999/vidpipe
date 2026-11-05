@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Iterable
@@ -105,10 +107,127 @@ def probe_duration(input_path: Path) -> float:
     return duration
 
 
-def _concat_quote(path: Path) -> str:
+def _concat_quote(path: Path, prefix: str = "") -> str:
     """Quote a path for FFmpeg's concat-demuxer file syntax."""
     value = str(path.resolve()).replace("\\", "\\\\").replace("'", "\\'")
-    return f"file '{value}'\n"
+    return f"file '{prefix}{value}'\n"
+
+
+class BackendUnavailable(RuntimeError):
+    """A backend cannot run here; remove_ranges moves on to the next one."""
+
+
+def _temp_output(output_path: Path) -> Path:
+    """A free temporary name beside the output; the final file is replaced only after success."""
+    fd, name = tempfile.mkstemp(
+        prefix=f".{output_path.stem}.vidpipe-", suffix=output_path.suffix, dir=str(output_path.parent)
+    )
+    os.close(fd)
+    Path(name).unlink()
+    return Path(name)
+
+
+def _verify(path: Path, keep) -> None:
+    """Reject empty or truncated output. Stream copy snaps cuts to keyframes, so allow slack."""
+    expected = sum(end - start for start, end in keep)
+    got = probe_duration(path)
+    if abs(got - expected) > 2.0 * len(keep) + 0.05 * expected:
+        raise RuntimeError(f"output is {got:.3f}s, expected about {expected:.3f}s")
+
+
+class PipeBackend:
+    """One FFmpeg process reads the source once; the cut list arrives on stdin.
+
+    No segment files and no list file are written, and nothing is buffered
+    in RAM beyond FFmpeg's own packet queue.
+    """
+
+    name = "pipe"
+
+    def run(self, input_path: Path, keep, duration: float, output_path: Path) -> None:
+        lines = []
+        for start, end in keep:
+            lines.append(_concat_quote(input_path, prefix="file:"))
+            if start > 0:
+                lines.append(f"inpoint {start:.6f}\n")
+            if end < duration:
+                lines.append(f"outpoint {end:.6f}\n")
+        temporary_output = _temp_output(output_path)
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            # A list read from a pipe needs the pipe protocol and "file:" paths.
+            "-f", "concat", "-safe", "0", "-protocol_whitelist", "file,pipe",
+            "-i", "pipe:0", "-map", "0", "-c", "copy", str(temporary_output),
+        ]
+        print("[vidpipe] Cutting and joining in one pass (stream copy)...")
+        try:
+            subprocess.run(command, input="".join(lines), text=True, check=True)
+            _verify(temporary_output, keep)
+            os.replace(temporary_output, output_path)
+        finally:
+            temporary_output.unlink(missing_ok=True)
+
+
+class DiskBackend:
+    """Current behaviour: kept parts become files beside the output, then are joined."""
+
+    name = "disk"
+
+    def run(self, input_path: Path, keep, duration: float, output_path: Path) -> None:
+        _copy_via_segments(input_path, keep, duration, output_path, output_path.parent)
+
+
+def _free_ram_bytes() -> int:
+    """MemAvailable from /proc/meminfo (Linux); 0 when unreadable."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as file:
+            for line in file:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+class TmpfsBackend:
+    """Same as DiskBackend, but the kept parts live in RAM (/dev/shm)."""
+
+    name = "tmpfs"
+    root = "/dev/shm"   # shortcut: add XDG_RUNTIME_DIR if a system has no /dev/shm
+    margin = 1.15       # estimate = source size x kept fraction x margin
+    ram_share = 0.5     # never plan to use more than half of what is free
+
+    def run(self, input_path: Path, keep, duration: float, output_path: Path) -> None:
+        if not os.path.isdir(self.root) or not os.access(self.root, os.W_OK):
+            raise BackendUnavailable(f"{self.root} is not available")
+        kept = sum(end - start for start, end in keep) / duration
+        need = input_path.stat().st_size * kept * self.margin
+        budget = min(shutil.disk_usage(self.root).free, _free_ram_bytes()) * self.ram_share
+        if need > budget:
+            raise BackendUnavailable(
+                f"kept parts need ~{need / 2**30:.2f} GiB but only {budget / 2**30:.2f} GiB of RAM may be used"
+            )
+        _copy_via_segments(input_path, keep, duration, output_path, Path(self.root))
+
+
+# Order matters: first = least disk I/O, last = always-works fallback.
+BACKENDS = (PipeBackend, TmpfsBackend, DiskBackend)
+
+
+def _run_backends(input_path: Path, keep, duration: float, output_path: Path, only: str | None) -> None:
+    chosen = [cls() for cls in BACKENDS if only in (None, cls.name)]
+    if not chosen:
+        raise ValueError(f"unknown backend {only!r}; use one of {[c.name for c in BACKENDS]}")
+    for index, backend in enumerate(chosen):
+        try:
+            backend.run(input_path, keep, duration, output_path)
+            print(f"[vidpipe] Backend used: {backend.name}")
+            return
+        except (BackendUnavailable, subprocess.CalledProcessError, OSError, RuntimeError) as error:
+            if index == len(chosen) - 1:
+                raise
+            print(f"[vidpipe] Backend {backend.name} failed ({error}); trying {chosen[index + 1].name}",
+                  file=sys.stderr)
 
 
 def remove_ranges(
@@ -116,6 +235,7 @@ def remove_ranges(
     specifications: Iterable[str],
     output_name: str | None = None,
     overwrite: bool = False,
+    backend: str | None = None,
 ) -> int:
     """Remove multiple intervals and concatenate kept parts without re-encoding."""
     input_path = Path(input_name).expanduser().resolve()
@@ -142,18 +262,32 @@ def remove_ranges(
         )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    print(
+        f"[vidpipe] Duration: {duration:.3f}s | "
+        f"Removing {len(remove)} range(s) | Keeping {len(keep)} segment(s)"
+    )
+    # backend: "pipe", "tmpfs" or "disk" forces one; None tries them in that order.
+    _run_backends(input_path, keep, duration, output_path, backend)
+
+    removed_seconds = sum(end - start for start, end in remove)
+    print(
+        f"[vidpipe] Done: {output_path}\n"
+        f"[vidpipe] Removed {removed_seconds:.3f}s; "
+        f"kept approximately {duration - removed_seconds:.3f}s."
+    )
+    return 0
+
+
+def _copy_via_segments(input_path: Path, keep, duration: float, output_path: Path, work_dir: Path) -> None:
+    """Disk/tmpfs strategy: cut kept parts into work_dir, then join them into output_path."""
     # Temporary segments live beside the output, avoiding an unexpectedly small /tmp.
     with tempfile.TemporaryDirectory(
-        prefix=".vidpipe-cut-", dir=str(output_path.parent)
+        prefix=".vidpipe-cut-", dir=str(work_dir)
     ) as temporary_directory:
         temp_dir = Path(temporary_directory)
         segment_paths: list[Path] = []
         segment_suffix = output_path.suffix or input_path.suffix or ".mkv"
 
-        print(
-            f"[vidpipe] Duration: {duration:.3f}s | "
-            f"Removing {len(remove)} range(s) | Keeping {len(keep)} segment(s)"
-        )
         for index, (start, end) in enumerate(keep, start=1):
             segment_path = temp_dir / f"part_{index:03d}{segment_suffix}"
             command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"]
@@ -197,11 +331,3 @@ def remove_ranges(
             os.replace(temporary_output, output_path)
         finally:
             temporary_output.unlink(missing_ok=True)
-
-    removed_seconds = sum(end - start for start, end in remove)
-    print(
-        f"[vidpipe] Done: {output_path}\n"
-        f"[vidpipe] Removed {removed_seconds:.3f}s; "
-        f"kept approximately {duration - removed_seconds:.3f}s."
-    )
-    return 0
