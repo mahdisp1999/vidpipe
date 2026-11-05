@@ -12,6 +12,7 @@ from pathlib import Path
 from . import __version__
 from .config import load_config
 from .controller import Controller, State, StateError
+from .cut import remove_ranges
 from .controls import KeyboardControls
 from .memory import configure_vram_limit, derive_memory_plan, device_name, gpu_memory_stats, select_device
 from .naming import make_output_path
@@ -69,6 +70,10 @@ Keys work immediately; Enter is not required. Ctrl+C requests a clean stop.
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("input", nargs="?", help="input video file (FFmpeg detects its format by default)")
+    parser.add_argument(
+        "--remove-range", action="append", metavar="START-END",
+        help="remove a time range without re-encoding; repeat for multiple ranges",
+    )
     parser.add_argument("-o", "--output", help="exact output file path; generated model-based name is used when omitted")
     parser.add_argument("--output-dir", default="output", help="directory for generated output names (default: output)")
     default_config = Path.cwd() / "config.yaml"
@@ -383,6 +388,8 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     try:
+        if args.remove_range:
+            return remove_ranges(args.input, args.remove_range, args.output, args.overwrite)
         return _run(args)
     except (OSError, RuntimeError, ValueError) as error:
         print(f"vidpipe: error: {error}", file=sys.stderr)
